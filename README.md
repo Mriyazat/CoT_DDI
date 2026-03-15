@@ -6,6 +6,21 @@ Chain-of-thought distillation for drug-drug interaction classification.
 
 CoT_DDI is a research project focused on distilling pharmacological reasoning from a large language model (Llama-3.3-70B) into a more efficient student model (Qwen2.5-7B) for drug-drug interaction (DDI) prediction tasks. By leveraging chain-of-thought (CoT) prompting and an ensemble-based filtering approach, we achieve strong performance while maintaining computational efficiency.
 
+## Project structure
+
+CoT_DDI/ 
+├── README.md 
+├── LICENSE 
+├── .gitignore 
+├── setup_env.sh 
+├── activate_env.sh
+├── configs/ │ └── [configuration files] 
+├── data/ │ └── [datasets] 
+├── experiments/ │ └── [experiment results and logs]
+├── scripts/ │ └── [utility and automation scripts] 
+└── src/ └── [source code]
+
+
 ## Purpose
 
 This project demonstrates how to transfer complex pharmacological reasoning and decision-making capabilities from a large teacher model to a smaller, more practical student model through:
