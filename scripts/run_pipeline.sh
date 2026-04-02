@@ -1,251 +1,257 @@
 #!/bin/bash
-# Master pipeline — run on compute node (4x H100, ~48h total).
-# Usage: sbatch scripts/run_pipeline.sh  (or bash scripts/run_pipeline.sh)
-#
-# All DDP training uses torchrun, all inference uses plain python (vLLM).
-# These MUST be separate processes to avoid CUDA fork issues.
+# Master pipeline for DDI CoT Distillation V3
+# Run phases sequentially; each phase has resume support.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
-source activate_env.sh
 
-NPROC=${NPROC:-4}  # GPUs per node
-SEED=42
+# Output dir: $SCRATCH/ddi_v3_outputs on cluster, ./outputs locally
+if [ -n "${SCRATCH:-}" ]; then
+    OUT_DIR="$SCRATCH/ddi_v3_outputs"
+    CKPT_BASE="$SCRATCH/ddi_checkpoints_v3"
+else
+    OUT_DIR="$PROJECT_DIR/outputs"
+    CKPT_BASE="$PROJECT_DIR/outputs/checkpoints"
+fi
 
-echo "==============================================="
-echo "DDI CoT Distillation V2 — Full Pipeline"
-echo "Project: $PROJECT_DIR"
-echo "GPUs: $NPROC"
-echo "Started: $(date)"
-echo "==============================================="
+echo "============================================"
+echo "DDI CoT Distillation V3 Pipeline"
+echo "Project dir: $PROJECT_DIR"
+echo "Output dir:  $OUT_DIR"
+echo "Checkpoint:  $CKPT_BASE"
+echo "============================================"
 
-echo ""
-echo "=== Phase 0: Verifying data ==="
-python -c "
-import json, os
-cfg_data = '$PROJECT_DIR/configs/config.yaml'
-from src.utils import load_config
-cfg = load_config(cfg_data)
-d = cfg['data']['processed_dir']
-for f in ['train.jsonl', 'test.jsonl', 'label_map.json', 'train_cot.jsonl']:
-    p = os.path.join(d, f)
-    if not os.path.exists(p):
-        print(f'MISSING: {p}')
-        exit(1)
-import pandas as pd
-train = pd.read_json(os.path.join(d, 'train.jsonl'), lines=True)
-test = pd.read_json(os.path.join(d, 'test.jsonl'), lines=True)
-cot = pd.read_json(os.path.join(d, 'train_cot.jsonl'), lines=True)
-with open(os.path.join(d, 'label_map.json')) as f_:
-    lm = json.load(f_)
-print(f'Train: {len(train):,}  Test: {len(test):,}  CoT: {len(cot):,}  Labels: {len(lm)}')
-print('Phase 0: OK')
-"
+# ── Phase 0: Data preparation (run locally before cluster) ───────────
+phase0() {
+    echo ""
+    echo "=== Phase 0a: Extract dataset from DrugBank XML ==="
+    python3 scripts/extract_dataset_from_xml.py
 
-echo ""
-echo "=== Phase 1: Model smoke test ==="
-python -c "
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
-m = 'Qwen/Qwen2.5-7B-Instruct'
-tok = AutoTokenizer.from_pretrained(m, trust_remote_code=True)
-mdl = AutoModelForCausalLM.from_pretrained(m, torch_dtype=torch.bfloat16, trust_remote_code=True)
-ids = tok('Hello world', return_tensors='pt')
-with torch.no_grad(): out = mdl(**ids)
-print(f'Logits shape: {out.logits.shape}')
-print('Phase 1: OK')
-del mdl; import gc; gc.collect(); torch.cuda.empty_cache()
-"
+    echo ""
+    echo "=== Phase 0b: Build fingerprints ==="
+    python3 scripts/build_fingerprints.py
 
-echo ""
-echo "=== Phase 4a: Training B (label-only) ==="
-torchrun --nproc_per_node=$NPROC -m src.student_training --mode label --seed $SEED
+    echo ""
+    echo "=== Phase 0c: Data preparation ==="
+    python3 -m src.data_preparation
 
-echo "=== Phase 4a: Evaluating B ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_finetuned, compute_classification_metrics
-import json, os
+    echo ""
+    echo "=== Phase 0: Verification ==="
+    echo "Checking output files..."
+    for f in data/processed/{interactions_full.jsonl,drug_profiles.json,label_map.json,severity_map.json,train.jsonl,test.jsonl,coarse_category_map.json,retrieved_examples_train.json}; do
+        if [ -f "$f" ]; then
+            lines=$(wc -l < "$f")
+            echo "  OK: $f ($lines lines)"
+        else
+            echo "  MISSING: $f"
+            exit 1
+        fi
+    done
+    echo "Phase 0 complete."
+}
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'B_label_s42', 'final')
-else:
-    ckpt = 'outputs/checkpoints/B_label_s42/final'
+# ── Phase 1: Teacher generation (cluster, 4x H100) ──────────────────
+phase1() {
+    echo ""
+    echo "=== Phase 1: Teacher trace generation ==="
+    python3 -m src.teacher_generation --config configs/config.yaml
 
-pred_path, eff = predict_finetuned(cfg, ckpt, 'B_label_only')
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'B_label_only')
-print(f\"B: Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
+    echo ""
+    echo "=== Phase 1: Verification ==="
+    trace_file="$OUT_DIR/teacher_traces/full_traces.jsonl"
+    if [ -f "$trace_file" ]; then
+        n=$(wc -l < "$trace_file")
+        echo "  Traces generated: $n"
+    else
+        echo "  MISSING: $trace_file"
+        exit 1
+    fi
+}
 
-echo ""
-echo "=== Phase 4b: Training C_naive (reproducing failure) ==="
-torchrun --nproc_per_node=$NPROC -m src.student_training --mode cot_naive --seed $SEED
+# ── Phase 1.5: Hard trace rejection ──────────────────────────────────
+phase1_5() {
+    echo ""
+    echo "=== Phase 1.5: Hard trace rejection ==="
+    python3 -m src.hard_rejection --config configs/config.yaml
 
-echo "=== Phase 4b: Evaluating C_naive ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_finetuned, compute_classification_metrics
-import json, os
+    echo ""
+    echo "=== Phase 1.5: Verification ==="
+    filtered="$OUT_DIR/teacher_traces/full_traces_hard_filtered.jsonl"
+    if [ -f "$filtered" ]; then
+        n=$(wc -l < "$filtered")
+        echo "  Traces after hard rejection: $n"
+    else
+        echo "  MISSING: $filtered"
+        exit 1
+    fi
+}
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'C_naive_s42', 'final')
-else:
-    ckpt = 'outputs/checkpoints/C_naive_s42/final'
+# ── Phase 1.6: Grounded factuality scoring ───────────────────────────
+phase1_6() {
+    echo ""
+    echo "=== Phase 1.6: Grounded factuality verification ==="
+    python3 -m src.grounded_factuality --config configs/config.yaml --split
 
-pred_path, eff = predict_finetuned(cfg, ckpt, 'C_naive')
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'C_naive')
-print(f\"C_naive: Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
+    echo ""
+    echo "=== Phase 1.6: Verification ==="
+    scored="$OUT_DIR/teacher_traces/full_traces_scored.jsonl"
+    if [ -f "$scored" ]; then
+        n=$(wc -l < "$scored")
+        echo "  Scored traces: $n"
+    else
+        echo "  MISSING: $scored"
+        exit 1
+    fi
 
-echo ""
-echo "=== Phase 4c: Training C_seq (sequential from B checkpoint) ==="
-torchrun --nproc_per_node=$NPROC -m src.student_training --mode sequential --seed $SEED
+    low="$OUT_DIR/teacher_traces/traces_for_refinement.jsonl"
+    high="$OUT_DIR/teacher_traces/traces_high_quality.jsonl"
+    if [ -f "$low" ] && [ -f "$high" ]; then
+        n_low=$(wc -l < "$low")
+        n_high=$(wc -l < "$high")
+        echo "  High-quality: $n_high | For refinement: $n_low"
+    fi
+}
 
-echo "=== Phase 4c: Evaluating C_seq ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_finetuned, compute_classification_metrics
-import json, os
+# ── Phase 1.7: Targeted self-refinement ──────────────────────────────
+phase1_7() {
+    echo ""
+    echo "=== Phase 1.7: Targeted self-refinement ==="
+    python3 -m src.trace_refinement --config configs/config.yaml
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'C_seq_s42', 'final')
-else:
-    ckpt = 'outputs/checkpoints/C_seq_s42/final'
+    echo ""
+    echo "=== Phase 1.7: Verification ==="
+    final="$OUT_DIR/teacher_traces/full_traces_final.jsonl"
+    if [ -f "$final" ]; then
+        n=$(wc -l < "$final")
+        echo "  Final training traces: $n"
+    else
+        echo "  MISSING: $final"
+        exit 1
+    fi
 
-pred_path, eff = predict_finetuned(cfg, ckpt, 'C_seq')
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'C_seq')
-print(f\"C_seq: Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
+    cot_file="data/processed/train_cot.jsonl"
+    if [ -f "$cot_file" ]; then
+        n=$(wc -l < "$cot_file")
+        echo "  Student training data: $n traces"
+    else
+        echo "  MISSING: $cot_file"
+        exit 1
+    fi
+}
 
-echo ""
-echo "=== Phase 4d: Training C_mix (mixed label+CoT) ==="
-torchrun --nproc_per_node=$NPROC -m src.student_training --mode mixed --seed $SEED
+# ── Phase 3: Student training (cluster, 4x H100 DDP) ────────────────
+phase3() {
+    echo ""
+    echo "=== Phase 3: Student training ==="
 
-echo "=== Phase 4d: Evaluating C_mix ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_finetuned, compute_classification_metrics
-import json, os
+    echo "--- Condition B: Label-only ---"
+    torchrun --nproc_per_node=4 -m src.student_training \
+        --mode label --config configs/config.yaml
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'C_mix_s42', 'final')
-else:
-    ckpt = 'outputs/checkpoints/C_mix_s42/final'
+    echo "--- Condition C_naive: Naive CoT ---"
+    torchrun --nproc_per_node=4 -m src.student_training \
+        --mode cot_naive --config configs/config.yaml
 
-pred_path, eff = predict_finetuned(cfg, ckpt, 'C_mix')
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'C_mix')
-print(f\"C_mix: Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
+    echo "--- Condition C_seq: Sequential ---"
+    torchrun --nproc_per_node=4 -m src.student_training \
+        --mode sequential --config configs/config.yaml
 
-echo ""
-echo "=== Phase 4e: Training C_wt (sequential + weighted cls loss) ==="
-torchrun --nproc_per_node=$NPROC -m src.student_training --mode weighted --seed $SEED --cls-weight 10.0
+    echo "--- Condition C_compact: Compact (ablation) ---"
+    torchrun --nproc_per_node=4 -m src.student_training \
+        --mode compact --config configs/config.yaml
 
-echo "=== Phase 4e: Evaluating C_wt ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_finetuned, compute_classification_metrics
-import json, os
+    echo "--- Condition C_summary: Summary (PRIMARY) ---"
+    torchrun --nproc_per_node=4 -m src.student_training \
+        --mode summary --config configs/config.yaml
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'C_wt_s42', 'final')
-else:
-    ckpt = 'outputs/checkpoints/C_wt_s42/final'
+    echo ""
+    echo "=== Phase 3: Verification ==="
+    for cond in B_label C_naive C_seq C_compact100 C_summary; do
+        d="$CKPT_BASE/${cond}_s42/final"
+        if [ -d "$d" ]; then
+            echo "  OK: $d"
+        else
+            echo "  MISSING: $d"
+        fi
+    done
+}
 
-pred_path, eff = predict_finetuned(cfg, ckpt, 'C_wt')
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'C_wt')
-print(f\"C_wt: Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
+# ── Phase 4: Evaluation ──────────────────────────────────────────────
+phase4() {
+    echo ""
+    echo "=== Phase 4: Multi-task evaluation ==="
+    for cond in B_label C_naive C_seq C_compact100 C_summary; do
+        ckpt_dir="$CKPT_BASE/${cond}_s42/final"
+        if [ -d "$ckpt_dir" ]; then
+            echo "--- Evaluating $cond ---"
+            python3 -m src.evaluation --condition "$cond" \
+                --checkpoint "$ckpt_dir" --config configs/config.yaml
+        else
+            echo "  Skipping $cond (no checkpoint at $ckpt_dir)"
+        fi
+    done
 
-echo ""
-echo "=== Phase 5: Training C_compact (all three fixes combined) ==="
-torchrun --nproc_per_node=$NPROC -m src.student_training \
-    --mode compact --seed $SEED \
-    --cls-weight 10.0 --cot-max-words 100 --min-per-class 50 --sampling-temperature 0.25
+    echo ""
+    echo "--- Comparison ---"
+    python3 -m src.evaluation --condition dummy --checkpoint dummy \
+        --compare B_label C_naive C_seq C_compact100 C_summary \
+        --config configs/config.yaml
+}
 
-echo "=== Phase 5: Evaluating C_compact ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_finetuned, compute_classification_metrics
-import json, os
+# ── Phase 4b: API judge evaluation (requires internet) ───────────────
+phase4b() {
+    echo ""
+    echo "=== Phase 4b: API judge evaluation ==="
+    echo "--- Evaluating teacher traces ---"
+    python3 -m src.api_judge_eval --config configs/config.yaml --source teacher
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'C_compact_s42', 'final')
-else:
-    ckpt = 'outputs/checkpoints/C_compact_s42/final'
+    echo ""
+    echo "--- Evaluating student traces ---"
+    python3 -m src.api_judge_eval --config configs/config.yaml --source student
 
-pred_path, eff = predict_finetuned(cfg, ckpt, 'C_compact')
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'C_compact')
-print(f\"C_compact: Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
+    echo ""
+    echo "=== Phase 4b: Verification ==="
+    for src_name in teacher student; do
+        f="$OUT_DIR/results/api_judge_${src_name}_summary.json"
+        if [ -f "$f" ]; then
+            echo "  OK: $f"
+        else
+            echo "  MISSING: $f"
+        fi
+    done
+}
 
-echo ""
-echo "=== Phase 6: Self-consistency (n=5) on C_compact ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import predict_two_stage_real, compute_classification_metrics
-import json, os
+# ── Phase 5: Chatbot demo ────────────────────────────────────────────
+phase5() {
+    echo ""
+    echo "=== Phase 5: Clinical DDI Chatbot ==="
+    python3 app/chatbot.py
+}
 
-cfg = load_config()
-scratch = os.environ.get('SCRATCH', '')
-if scratch:
-    r_ckpt = os.path.join(scratch, 'ddi_checkpoints_v2', 'C_compact_s42', 'final')
-else:
-    r_ckpt = 'outputs/checkpoints/C_compact_s42/final'
-
-pred_path = predict_two_stage_real(cfg, r_ckpt, condition_name='D_compact_SC', n_samples=5)
-with open(os.path.join(cfg['data']['processed_dir'], 'label_map.json')) as f:
-    lm = {int(k): v for k, v in json.load(f).items()}
-metrics = compute_classification_metrics(pred_path, lm, 'D_compact_SC')
-print(f\"D_compact_SC (n=5): Macro F1={metrics['macro_f1']:.4f} | Micro F1={metrics['micro_f1']:.4f}\")
-"
-
-echo ""
-echo "=== Phase 7: Judge evaluation of best reasoning model ==="
-python -c "
-from src.utils import load_config
-from src.evaluation import judge_student_reasoning
-
-cfg = load_config()
-import os
-for pred in ['C_compact', 'C_wt', 'C_seq']:
-    pred_path = f'outputs/results/{pred}_predictions.jsonl'
-    if os.path.exists(pred_path):
-        print(f'Judging {pred} ...')
-        judge_student_reasoning(cfg, pred_path)
-        print(f'Judge evaluation for {pred} complete.')
-        break
-else:
-    print('No reasoning predictions found for judge evaluation.')
-"
-
-echo ""
-echo "==============================================="
-echo "Pipeline complete: $(date)"
-echo "==============================================="
+# ── CLI ───────────────────────────────────────────────────────────────
+case "${1:-all}" in
+    phase0)   phase0 ;;
+    phase1)   phase1 ;;
+    phase1.5) phase1_5 ;;
+    phase1.6) phase1_6 ;;
+    phase1.7) phase1_7 ;;
+    phase3)   phase3 ;;
+    phase4)   phase4 ;;
+    phase4b)  phase4b ;;
+    phase5)   phase5 ;;
+    all)
+        phase0
+        phase1
+        phase1_5
+        phase1_6
+        phase1_7
+        phase3
+        phase4
+        phase4b
+        ;;
+    *)
+        echo "Usage: $0 {phase0|phase1|phase1.5|phase1.6|phase1.7|phase3|phase4|phase4b|phase5|all}"
+        exit 1
+        ;;
+esac

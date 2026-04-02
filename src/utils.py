@@ -3,9 +3,13 @@ import json
 import random
 import logging
 import yaml
-import torch
 import numpy as np
 from pathlib import Path
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def load_config(config_path: str = None) -> dict:
@@ -21,10 +25,24 @@ def load_config(config_path: str = None) -> dict:
         if config_path is None:
             raise FileNotFoundError("Cannot find configs/config.yaml")
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+
+    # On Compute Canada, redirect all large outputs to $SCRATCH
+    scratch = os.environ.get("SCRATCH", "")
+    if scratch:
+        cfg["project"]["output_dir"] = os.path.join(
+            scratch, "ddi_v3_outputs"
+        )
+    return cfg
 
 
-def setup_logging(name: str, log_dir: str = "outputs/logs") -> logging.Logger:
+def setup_logging(name: str, log_dir: str = None) -> logging.Logger:
+    if log_dir is None:
+        scratch = os.environ.get("SCRATCH", "")
+        if scratch:
+            log_dir = os.path.join(scratch, "ddi_v3_outputs", "logs")
+        else:
+            log_dir = "outputs/logs"
     os.makedirs(log_dir, exist_ok=True)
     logger = logging.getLogger(name)
     if logger.handlers:
@@ -48,13 +66,14 @@ def setup_logging(name: str, log_dir: str = "outputs/logs") -> logging.Logger:
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
 
 def gpu_info() -> str:
-    if not torch.cuda.is_available():
+    if torch is None or not torch.cuda.is_available():
         return "No GPU available"
     lines = []
     for i in range(torch.cuda.device_count()):
@@ -65,47 +84,45 @@ def gpu_info() -> str:
 
 
 def ensure_dirs(cfg: dict):
-    for d in [os.path.join(cfg["project"]["output_dir"], "figures"),
-              os.path.join(cfg["project"]["output_dir"], "teacher_traces"),
-              os.path.join(cfg["project"]["output_dir"], "checkpoints"),
-              os.path.join(cfg["project"]["output_dir"], "results"),
-              os.path.join(cfg["project"]["output_dir"], "logs")]:
+    for d in [
+        os.path.join(cfg["project"]["output_dir"], "figures"),
+        os.path.join(cfg["project"]["output_dir"], "teacher_traces"),
+        os.path.join(cfg["project"]["output_dir"], "checkpoints"),
+        os.path.join(cfg["project"]["output_dir"], "results"),
+        os.path.join(cfg["project"]["output_dir"], "logs"),
+    ]:
         os.makedirs(d, exist_ok=True)
 
 
-LABEL_CATEGORY_GROUPS = {
-    "adverse_effects": "Risk/severity of adverse effects",
-    "serum_increase": "Serum concentration increase",
-    "serum_decrease": "Serum concentration decrease",
-    "metabolism": "Metabolism changes",
-    "activity_increase": "Therapeutic efficacy increase",
-    "activity_decrease": "Therapeutic efficacy decrease",
-    "absorption": "Absorption changes",
-    "excretion": "Excretion rate changes",
-    "other": "Other interactions",
+COARSE_CATEGORY_KEYWORDS = {
+    "metabolism_decrease": ["metabolism of #Drug2 can be decreased", "metabolism of #Drug1 can be decreased"],
+    "metabolism_increase": ["metabolism of #Drug2 can be increased", "metabolism of #Drug1 can be increased"],
+    "serum_increase": ["serum concentration of #Drug2 can be increased", "serum concentration of #Drug1 can be increased",
+                       "serum concentration of the active metabolite"],
+    "serum_decrease": ["serum concentration of #Drug2 can be decreased", "serum concentration of #Drug1 can be decreased"],
+    "adverse_effects": ["risk or severity of adverse effects"],
+    "efficacy_decrease": ["therapeutic efficacy of #Drug2 can be decreased", "therapeutic efficacy of #Drug1 can be decreased"],
+    "efficacy_increase": ["therapeutic efficacy of #Drug2 can be increased", "therapeutic efficacy of #Drug1 can be increased"],
+    "excretion_decrease": ["may decrease the excretion rate", "excretion of #Drug2 can be decreased",
+                           "excretion of #Drug1 can be decreased"],
+    "excretion_increase": ["may increase the excretion rate", "excretion of #Drug2 can be increased",
+                           "excretion of #Drug1 can be increased"],
+    "absorption_decrease": ["absorption of #Drug2 can be decreased", "absorption of #Drug1 can be decreased"],
+    "absorption_increase": ["absorption of #Drug2 can be increased", "absorption of #Drug1 can be increased"],
+    "qtc_cardiac": ["qtc-prolonging", "qtc interval", "cardiac", "arrhythmia", "torsade"],
+    "cns_effects": ["cns depressant", "serotonergic", "sedation", "respiratory depression"],
+    "bleeding": ["hemorrhagic", "bleeding", "anticoagulant"],
+    "nephrotoxicity": ["nephrotoxic", "renal"],
+    "hepatotoxicity": ["hepatotoxic", "liver"],
+    "hypotension": ["hypotensive"],
+    "hyperkalemia": ["hyperkalemic", "hyperkalemia"],
 }
 
 
-def categorize_interaction(text: str) -> str:
-    t = text.lower()
-    if "risk or severity of adverse" in t:
-        return "adverse_effects"
-    if "serum concentration" in t and "increase" in t:
-        return "serum_increase"
-    if "serum concentration" in t and "decrease" in t:
-        return "serum_decrease"
-    if "metabolism" in t and "increase" in t:
-        return "activity_increase"
-    if "metabolism" in t and "decrease" in t:
-        return "metabolism"
-    if "metabolism" in t:
-        return "metabolism"
-    if "therapeutic efficacy" in t and "increase" in t:
-        return "activity_increase"
-    if "therapeutic efficacy" in t and "decrease" in t:
-        return "activity_decrease"
-    if "absorption" in t:
-        return "absorption"
-    if "excretion" in t:
-        return "excretion"
+def categorize_interaction(template: str) -> str:
+    t = template.lower().replace("#drug1", "").replace("#drug2", "")
+    for category, keywords in COARSE_CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower().replace("#drug1", "").replace("#drug2", "") in t:
+                return category
     return "other"

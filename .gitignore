@@ -1,27 +1,44 @@
-.DS_Store
+# Python
 __pycache__/
 *.py[cod]
-*.so
 *.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.ipynb_checkpoints/
+dist/
+build/
+*.egg
 
-.env
-.venv/
-venv/
-ddi_venv/
-
-outputs/
-data/raw/*
-data/processed/*
-!data/raw/.gitkeep
+# Data (too large for git)
+data/raw/*.xml
+data/processed/*.jsonl
+data/processed/*.json
 !data/processed/.gitkeep
 
-wandb/
-logs/
-*.log
+# Outputs and checkpoints
+outputs/
+checkpoints/
+*.ckpt
+*.safetensors
+*.bin
 
-huggingface/
+# SLURM logs
+*.out
+*.err
+slurm-*.out
+
+# Environment
+.env
+*.xsd
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace cache
 .cache/

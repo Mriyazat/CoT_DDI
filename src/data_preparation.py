@@ -1,355 +1,623 @@
 """
-Phase 1 – Data loading, drug-name resolution, stratified splitting, and prompt construction.
-"""
+Data preparation pipeline for DDI CoT Distillation V3.
 
+Handles:
+  1. Class filtering (keep >= min_pairs_per_class)
+  2. Label remapping to contiguous IDs
+  3. Coarse category mapping
+  4. Per-class training cap
+  5. Stratified 80/20 split
+  6. Drug profile enrichment
+  7. Severity label attachment
+  8. Dynamic few-shot retrieval precomputation
+  9. Prompt construction (teacher + student)
+"""
 import os
 import json
-import pandas as pd
+import pickle
+import random
 import numpy as np
-from collections import Counter
+import pandas as pd
+from collections import Counter, defaultdict
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 from src.utils import load_config, setup_logging, set_seed, ensure_dirs, categorize_interaction
 
 
-FEW_SHOT_EXAMPLES = [
-
-    {
-        "drug1_name": "Warfarin",
-        "drug1_smiles": "CC(=O)CC(C1=CC=CC=C1)C1=C(O)C2=CC=CC=C2OC1=O",
-        "drug2_name": "Aspirin",
-        "drug2_smiles": "CC(=O)OC1=CC=CC=C1C(O)=O",
-        "label": 49,
-        "label_text": "The risk or severity of adverse effects can be increased when Warfarin is combined with Aspirin.",
-        "cot": (
-            "Step 1: Warfarin is a vitamin K antagonist that inhibits clotting factor synthesis, "
-            "producing an anticoagulant effect and increasing bleeding risk.\n"
-            "Step 2: Aspirin irreversibly inhibits cyclooxygenase (COX-1/COX-2), blocking "
-            "thromboxane A2 production and impairing platelet aggregation.\n"
-            "Step 3: Co-administration amplifies bleeding risk through dual mechanisms – "
-            "reduced clotting factor synthesis plus impaired platelet function – "
-            "and aspirin can also displace warfarin from plasma protein binding sites, "
-            "raising free warfarin concentration."
-        ),
-    },
-    {
-        "drug1_name": "Metformin",
-        "drug1_smiles": "CN(C)C(=N)NC(N)=N",
-        "drug2_name": "Furosemide",
-        "drug2_smiles": "NS(=O)(=O)C1=CC(C(=O)O)=CC(NCC2=CC=CO2)=C1Cl",
-        "label": 49,
-        "label_text": "The risk or severity of adverse effects can be increased when Metformin is combined with Furosemide.",
-        "cot": (
-            "Step 1: Metformin inhibits hepatic gluconeogenesis and increases peripheral "
-            "glucose uptake; a rare but serious side effect is lactic acidosis, especially "
-            "when renal clearance is impaired.\n"
-            "Step 2: Furosemide is a loop diuretic that can cause volume depletion and "
-            "electrolyte imbalances, potentially reducing renal perfusion.\n"
-            "Step 3: Furosemide-induced renal impairment and dehydration can decrease "
-            "metformin clearance, increasing metformin plasma levels and the risk of "
-            "lactic acidosis – a life-threatening adverse effect."
-        ),
-    },
-    {
-        "drug1_name": "Simvastatin",
-        "drug1_smiles": "CCC(C)(C)C(=O)O[C@H]1C[C@@H](O)C=C2C=C[C@H](C)[C@H](CC[C@@H](O)CC(O)CC(O)=O)[C@@H]21",
-        "drug2_name": "Itraconazole",
-        "drug2_smiles": "CCC(C)N1N=CN(C1=O)C1=CC=C(C=C1)N1CCN(CC1)C1=CC=C(OC[C@H]2CO[C@@](CN3C=NC=N3)(O2)C2=CC=C(Cl)C=C2Cl)C=C1",
-        "label": 73,
-        "label_text": "The serum concentration of Simvastatin can be increased when it is combined with Itraconazole.",
-        "cot": (
-            "Step 1: Simvastatin is extensively metabolised by cytochrome P450 3A4 (CYP3A4) "
-            "in the liver, and its plasma levels are normally kept low by this first-pass metabolism.\n"
-            "Step 2: Itraconazole is a potent inhibitor of CYP3A4, blocking the primary "
-            "metabolic clearance pathway of simvastatin.\n"
-            "Step 3: When co-administered, itraconazole inhibits CYP3A4-mediated metabolism "
-            "of simvastatin, causing a marked increase in simvastatin serum concentration, "
-            "which elevates the risk of myopathy and rhabdomyolysis."
-        ),
-    },
-    {
-        "drug1_name": "Digoxin",
-        "drug1_smiles": "C[C@@H]1O[C@@H](O[C@@H]2[C@@H](O)C[C@H](O[C@@H]3[C@@H](O)C[C@H](O[C@@H]4CC[C@@]5(C)[C@H](CC[C@@H]6[C@@H]5C[C@H](O)[C@]5(C)[C@@H](C7=CC(=O)OC7)CC[C@]65O)C4)OC3C)OC2C)C[C@@H](O)[C@@H]1O",
-        "drug2_name": "Amiodarone",
-        "drug2_smiles": "CCCCC1=C(C=C(C=C1I)C(=O)C1=CC=C(OCCN(CC)CC)C=C1)I",
-        "label": 73,
-        "label_text": "The serum concentration of Digoxin can be increased when it is combined with Amiodarone.",
-        "cot": (
-            "Step 1: Digoxin is a cardiac glycoside with a narrow therapeutic index; "
-            "it is eliminated mainly by renal excretion via P-glycoprotein (P-gp) "
-            "mediated efflux in the renal tubules.\n"
-            "Step 2: Amiodarone is a potent inhibitor of P-glycoprotein, blocking "
-            "the transporter responsible for digoxin renal and biliary clearance.\n"
-            "Step 3: P-gp inhibition by amiodarone reduces digoxin elimination, "
-            "raising serum digoxin concentration by 50-100%, which can cause "
-            "dangerous cardiac arrhythmias, nausea, and visual disturbances."
-        ),
-    },
-
-    {
-        "drug1_name": "Erythromycin",
-        "drug1_smiles": "CC[C@H]1OC(=O)[C@H](C)[C@@H](O[C@H]2C[C@@](C)(OC)[C@@H](O)[C@H](C)O2)[C@H](C)[C@@H](O[C@@H]2O[C@H](C)C[C@@H]([C@H]2O)N(C)C)[C@](C)(O)C[C@@H](C)C(=O)[C@H](C)[C@@H](O)[C@]1(C)O",
-        "drug2_name": "Carbamazepine",
-        "drug2_smiles": "NC(=O)N1C2=CC=CC=C2C=CC2=CC=CC=C12",
-        "label": 47,
-        "label_text": "The metabolism of Carbamazepine can be decreased when combined with Erythromycin.",
-        "cot": (
-            "Step 1: Carbamazepine is an anticonvulsant primarily metabolised by CYP3A4 "
-            "in the liver to its active epoxide metabolite; its clearance is highly dependent "
-            "on CYP3A4 activity.\n"
-            "Step 2: Erythromycin is a macrolide antibiotic and a well-established mechanism-based "
-            "inhibitor of CYP3A4, forming a nitroso-alkane complex with the enzyme's haem group.\n"
-            "Step 3: CYP3A4 inhibition by erythromycin decreases the hepatic metabolism of "
-            "carbamazepine, leading to elevated plasma levels and an increased risk of "
-            "neurotoxicity (dizziness, ataxia, diplopia)."
-        ),
-    },
-
-    {
-        "drug1_name": "Rifampin",
-        "drug1_smiles": "CO[C@H]1\\C=C\\O[C@@]2(C)OC3=C(C2=O)C2=C(O)C(\\C=N\\N4CCN(C)CC4)=C(NC(=O)\\C(C)=C/C=C/[C@H](C)[C@H](O)[C@@H](C)[C@@H](O)[C@@H](C)[C@H](OC(C)=O)[C@@H]1C)C(O)=C2C(O)=C3C",
-        "drug2_name": "Dexamethasone",
-        "drug2_smiles": "[H][C@@]12C[C@@H](C)[C@](O)(C(=O)CO)[C@@]1(C)C[C@H](O)[C@@]1(F)[C@@]2([H])CCC2=CC(=O)C=C[C@]12C",
-        "label": 75,
-        "label_text": "The serum concentration of Dexamethasone can be decreased when it is combined with Rifampin.",
-        "cot": (
-            "Step 1: Dexamethasone is a synthetic corticosteroid that is extensively metabolised "
-            "by CYP3A4 in the liver; its bioavailability depends on this metabolic pathway.\n"
-            "Step 2: Rifampin is one of the most potent known inducers of CYP3A4 (and CYP2C9, "
-            "CYP2C19, and P-glycoprotein), upregulating enzyme expression via activation of "
-            "the pregnane X receptor (PXR).\n"
-            "Step 3: Rifampin-induced CYP3A4 upregulation accelerates dexamethasone metabolism, "
-            "substantially lowering its serum concentration and potentially rendering the "
-            "anti-inflammatory therapy ineffective."
-        ),
-    },
-    {
-        "drug1_name": "Phenobarbital",
-        "drug1_smiles": "CCC1(C(=O)NC(=O)NC1=O)C1=CC=CC=C1",
-        "drug2_name": "Metoprolol",
-        "drug2_smiles": "COCCc1ccc(OCC(O)CNC(C)C)cc1",
-        "label": 4,
-        "label_text": "The metabolism of Metoprolol can be increased when combined with Phenobarbital.",
-        "cot": (
-            "Step 1: Metoprolol is a beta-1 selective adrenergic blocker metabolised primarily "
-            "by CYP2D6, with additional contributions from CYP3A4; it undergoes extensive "
-            "hepatic first-pass metabolism.\n"
-            "Step 2: Phenobarbital is a barbiturate and potent inducer of multiple hepatic "
-            "cytochrome P450 enzymes (CYP3A4, CYP2C, CYP1A2) via constitutive androstane "
-            "receptor (CAR) activation, increasing enzyme protein levels.\n"
-            "Step 3: Chronic phenobarbital administration upregulates CYP enzymes that "
-            "contribute to metoprolol clearance, increasing its metabolism and reducing "
-            "plasma concentrations, which may compromise beta-blocker efficacy."
-        ),
-    },
-    {
-        "drug1_name": "Methylprednisolone",
-        "drug1_smiles": "[H][C@@]12CC[C@](O)(C(=O)CO)[C@@]1(C)C[C@H](O)[C@@]1([H])[C@@]2([H])C[C@H](C)C2=CC(=O)C=C[C@]12C",
-        "drug2_name": "Metformin",
-        "drug2_smiles": "CN(C)C(=N)NC(N)=N",
-        "label": 70,
-        "label_text": "The therapeutic efficacy of Metformin can be decreased when used in combination with Methylprednisolone.",
-        "cot": (
-            "Step 1: Metformin is a biguanide antidiabetic that lowers blood glucose by "
-            "suppressing hepatic gluconeogenesis, enhancing insulin sensitivity, and "
-            "increasing peripheral glucose uptake.\n"
-            "Step 2: Methylprednisolone is a synthetic corticosteroid that stimulates hepatic "
-            "gluconeogenesis, promotes glycogenolysis, and induces peripheral insulin resistance "
-            "as part of its metabolic effects.\n"
-            "Step 3: The hyperglycaemic action of methylprednisolone directly opposes the "
-            "glucose-lowering mechanism of metformin, reducing its therapeutic efficacy "
-            "and potentially leading to loss of glycaemic control in diabetic patients."
-        ),
-    },
-    {
-        "drug1_name": "Lithium",
-        "drug1_smiles": "[Li+]",
-        "drug2_name": "Ibuprofen",
-        "drug2_smiles": "CC(C)CC1=CC=C(C=C1)C(C)C(O)=O",
-        "label": 72,
-        "label_text": "Lithium may decrease the excretion rate of Ibuprofen which could result in a higher serum level.",
-        "cot": (
-            "Step 1: Ibuprofen is a non-steroidal anti-inflammatory drug (NSAID) that is "
-            "eliminated through renal excretion of both parent compound and glucuronide "
-            "conjugates; its clearance depends on adequate renal function.\n"
-            "Step 2: Lithium can impair renal concentrating ability and reduce glomerular "
-            "filtration rate (GFR) through its effects on aquaporin-2 channels and renal "
-            "tubular function, particularly with chronic use.\n"
-            "Step 3: Lithium-induced reduction in renal function decreases the excretion rate "
-            "of ibuprofen, leading to accumulation and higher serum levels, increasing the "
-            "risk of NSAID-related gastrointestinal and renal adverse effects."
-        ),
-    },
-]
-
-
-def load_raw_data(cfg: dict) -> pd.DataFrame:
-    path = cfg["data"]["raw_path"]
-    df = pd.read_csv(path, sep="\t", dtype={"ID1": str, "ID2": str, "Y": int})
-    df.columns = ["drug1_id", "drug2_id", "label", "label_text_template", "drug1_smiles", "drug2_smiles"]
-    return df
-
-
-def load_name_map(cfg: dict) -> dict:
-    path = cfg["data"]["name_map_path"]
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return {}
-
-
-def resolve_drug_names(df: pd.DataFrame, name_map: dict) -> pd.DataFrame:
-    """Add drug name columns.  Falls back to DrugBank ID when name is unknown."""
-    df["drug1_name"] = df["drug1_id"].map(lambda x: name_map.get(x, x))
-    df["drug2_name"] = df["drug2_id"].map(lambda x: name_map.get(x, x))
-    return df
-
-
-def build_label_map(df: pd.DataFrame) -> dict:
-    """Y-integer  →  canonical interaction text (one per label)."""
-    label_map = {}
-    for _, row in df.drop_duplicates("label").iterrows():
-        label_map[int(row["label"])] = row["label_text_template"]
-    return label_map
-
-
-def fill_template(template: str, name1: str, name2: str) -> str:
-    return template.replace("#Drug1", name1).replace("#Drug2", name2)
-
-
-def stratified_split(df: pd.DataFrame, train_ratio: float, seed: int):
-    train_df, test_df = train_test_split(
-        df, train_size=train_ratio, random_state=seed, stratify=df["label"]
-    )
-    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
-
-
+# ── Prompt templates ──────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
     "You are an expert pharmacologist specialising in drug-drug interactions. "
-    "Given two drugs with their molecular structures (SMILES notation), "
-    "analyse their pharmacological mechanisms step-by-step and predict "
-    "their interaction type."
+    "Given two drugs with their pharmacological profiles, analyse their "
+    "mechanisms step-by-step and predict their interaction type. "
+    "Include the severity if known."
 )
 
 TEACHER_SYSTEM_PROMPT = (
     "You are an expert pharmacologist specialising in drug-drug interactions. "
     "Given two drugs and their known interaction type, explain the "
-    "pharmacological mechanisms step-by-step. Discuss each drug's mechanism "
-    "of action and how their combination produces the stated interaction. "
-    "Structure your reasoning as numbered steps."
+    "pharmacological mechanisms step-by-step. Then provide a concise summary. "
+    "Structure your response as:\n\n"
+    "## Reasoning\n"
+    "[Numbered steps explaining the mechanism]\n\n"
+    "## Summary\n"
+    "[2-3 sentence summary of the key interaction mechanism]\n\n"
+    "## Classification\n"
+    "Y={label} -- \"{label_text}\"\n\n"
+    "## Severity\n"
+    "{Major/Moderate/Minor/Unknown}"
 )
 
 
-def _format_example(ex: dict, include_cot: bool = True) -> str:
-    """Format a single few-shot example."""
-    lines = [
-        f"Drug 1: {ex['drug1_name']}",
-        f"SMILES: {ex['drug1_smiles']}",
-        f"Drug 2: {ex['drug2_name']}",
-        f"SMILES: {ex['drug2_smiles']}",
-    ]
-    if include_cot:
-        lines.append("")
-        lines.append(ex["cot"])
-        lines.append(f"\nClassification: Y={ex['label']} — \"{ex['label_text']}\"")
-    return "\n".join(lines)
+def _format_drug_profile(profile: dict) -> str:
+    """Format a drug profile into a compact text block for prompts."""
+    lines = [f"  Description: {profile['description']}" if profile.get("description") else None]
+
+    if profile.get("mechanism_of_action"):
+        lines.append(f"  Mechanism: {profile['mechanism_of_action'][:200]}")
+
+    if profile.get("enzymes"):
+        enz_str = "; ".join(profile["enzymes"][:5])
+        lines.append(f"  Key enzymes: {enz_str}")
+
+    if profile.get("transporters"):
+        trans_str = "; ".join(profile["transporters"][:3])
+        lines.append(f"  Transporters: {trans_str}")
+
+    if profile.get("targets"):
+        tgt_str = "; ".join(profile["targets"][:3])
+        lines.append(f"  Targets: {tgt_str}")
+
+    if profile.get("smiles"):
+        lines.append(f"  SMILES: {profile['smiles'][:200]}")
+
+    return "\n".join(l for l in lines if l)
 
 
-def build_teacher_prompt(row: pd.Series, label_map: dict) -> str:
-    """
-    Construct the CoT rationale-generation prompt for the teacher.
-
-    The teacher is given the CORRECT interaction label and asked to explain
-    the pharmacological reasoning behind it. This is the standard approach
-    for CoT distillation -- the teacher generates reasoning, not predictions.
-    """
+def build_teacher_prompt(row, label_map, profiles, retrieved_examples=None):
+    """Construct the enriched teacher prompt with drug profiles and retrieved examples."""
     parts = []
 
-    for i, ex in enumerate(FEW_SHOT_EXAMPLES, 1):
-        parts.append(f"--- Example {i} ---")
-        parts.append(f"Drug 1: {ex['drug1_name']}")
-        parts.append(f"SMILES: {ex['drug1_smiles']}")
-        parts.append(f"Drug 2: {ex['drug2_name']}")
-        parts.append(f"SMILES: {ex['drug2_smiles']}")
-        parts.append(f"Known interaction: Y={ex['label']} — \"{ex['label_text']}\"")
-        parts.append(f"\n{ex['cot']}")
-        parts.append(f"\nClassification: Y={ex['label']} — \"{ex['label_text']}\"")
-        parts.append("")
+    if retrieved_examples:
+        for i, ex in enumerate(retrieved_examples, 1):
+            p1 = profiles.get(ex["drug1_id"], {})
+            p2 = profiles.get(ex["drug2_id"], {})
+            parts.append(f"--- Example {i} ---")
+            parts.append(f"Drug 1: {ex['drug1_name']} ({ex['drug1_id']})")
+            if p1:
+                parts.append(_format_drug_profile(p1))
+            parts.append(f"Drug 2: {ex['drug2_name']} ({ex['drug2_id']})")
+            if p2:
+                parts.append(_format_drug_profile(p2))
+            ex_label_text = label_map.get(ex["label"], "")
+            if "#Drug1" in ex_label_text:
+                ex_label_text = ex_label_text.replace("#Drug1", ex["drug1_name"]).replace("#Drug2", ex["drug2_name"])
+            parts.append(f"Interaction: Y={ex['label']} -- \"{ex_label_text}\"")
+            parts.append("")
 
     parts.append("--- Your turn ---")
+    p1 = profiles.get(row["drug1_id"], {})
+    p2 = profiles.get(row["drug2_id"], {})
+
     parts.append(f"Drug 1: {row['drug1_name']} ({row['drug1_id']})")
-    parts.append(f"SMILES: {row['drug1_smiles']}")
+    if p1:
+        parts.append(_format_drug_profile(p1))
     parts.append(f"Drug 2: {row['drug2_name']} ({row['drug2_id']})")
-    parts.append(f"SMILES: {row['drug2_smiles']}")
-    parts.append(f"Known interaction: Y={row['label']} — \"{row['label_text']}\"")
+    if p2:
+        parts.append(_format_drug_profile(p2))
+
+    severity = row.get("severity", "Unknown")
+    parts.append(f"Known interaction: Y={row['label']} -- \"{row['label_text']}\"")
+    parts.append(f"Known severity: {severity}")
     parts.append("")
     parts.append(
         "Explain step-by-step the pharmacological mechanisms behind this "
         "drug-drug interaction. Discuss each drug's mechanism of action and "
-        "how they combine to produce this effect. End with the classification line."
+        "how they combine to produce this effect. Then provide a concise summary. "
+        "End with the classification and severity."
     )
     return "\n".join(parts)
 
 
-def build_student_input(row: pd.Series) -> str:
-    """Input portion of the student prompt (no answer)."""
-    return (
-        f"Drug 1: {row['drug1_name']} ({row['drug1_id']})\n"
-        f"SMILES: {row['drug1_smiles']}\n"
-        f"Drug 2: {row['drug2_name']} ({row['drug2_id']})\n"
-        f"SMILES: {row['drug2_smiles']}\n\n"
-        "Explain step-by-step why these drugs interact and state the interaction type."
-    )
+def build_student_input(row, profiles, retrieved_examples=None):
+    """Build the student prompt (no answer, task instruction to predict)."""
+    parts = []
+
+    if retrieved_examples:
+        for i, ex in enumerate(retrieved_examples, 1):
+            p1 = profiles.get(ex["drug1_id"], {})
+            p2 = profiles.get(ex["drug2_id"], {})
+            parts.append(f"--- Example {i} ---")
+            parts.append(f"Drug 1: {ex['drug1_name']} ({ex['drug1_id']})")
+            if p1:
+                parts.append(_format_drug_profile(p1))
+            parts.append(f"Drug 2: {ex['drug2_name']} ({ex['drug2_id']})")
+            if p2:
+                parts.append(_format_drug_profile(p2))
+            parts.append(f"Interaction: Y={ex['label']} -- \"{ex.get('label_text', '')}\"")
+            sev = ex.get("severity", "Unknown")
+            parts.append(f"Severity: {sev}")
+            parts.append("")
+
+    p1 = profiles.get(row["drug1_id"], {})
+    p2 = profiles.get(row["drug2_id"], {})
+
+    parts.append(f"Drug 1: {row['drug1_name']} ({row['drug1_id']})")
+    if p1:
+        parts.append(_format_drug_profile(p1))
+    parts.append(f"Drug 2: {row['drug2_name']} ({row['drug2_id']})")
+    if p2:
+        parts.append(_format_drug_profile(p2))
+    parts.append("")
+    parts.append("Predict the interaction type, explain the mechanism briefly, "
+                 "and state the severity.")
+    return "\n".join(parts)
 
 
-def build_student_target_cot(row: pd.Series) -> str:
-    """Target output for CoT distillation training (populated after teacher generation)."""
-    return f"{row['teacher_cot']}\n\nClassification: Y={row['label']} — \"{row['label_text']}\""
+# ── Few-shot retrieval ────────────────────────────────────────────────
+
+def precompute_retrievals(train_df, profiles, drug_id_order, sim_matrix,
+                          fingerprints, top_k=5, min_diverse=2, seed=42,
+                          batch_size=500):
+    """Precompute top-k retrieved examples using vectorized numpy operations.
+
+    Pairs where either drug lacks fingerprints get no retrieved examples
+    (empty list) rather than random fallback, to avoid noise.
+    """
+    id_to_idx = {did: i for i, did in enumerate(drug_id_order)}
+    n_total = len(train_df)
+
+    fp_mask = np.array([
+        id_to_idx.get(row["drug1_id"]) is not None and
+        id_to_idx.get(row["drug2_id"]) is not None
+        for _, row in train_df.iterrows()
+    ])
+
+    all_indices = np.array(train_df.index.tolist())
+    all_labels = np.array(train_df["label"].tolist())
+
+    d1_sim_idx = np.full(n_total, -1, dtype=np.int32)
+    d2_sim_idx = np.full(n_total, -1, dtype=np.int32)
+    for i, (_, row) in enumerate(train_df.iterrows()):
+        i1 = id_to_idx.get(row["drug1_id"])
+        i2 = id_to_idx.get(row["drug2_id"])
+        if i1 is not None and i2 is not None:
+            d1_sim_idx[i] = i1
+            d2_sim_idx[i] = i2
+
+    fp_positions = np.where(fp_mask)[0]
+    n_with_fp = len(fp_positions)
+    n_skip = n_total - n_with_fp
+    print(f"  Pairs with fingerprints: {n_with_fp:,}, without: {n_skip:,}")
+
+    cand_d1 = d1_sim_idx[fp_mask]
+    cand_d2 = d2_sim_idx[fp_mask]
+    cand_labels = all_labels[fp_mask]
+    cand_orig_idx = all_indices[fp_mask]
+
+    sim_dense = sim_matrix
+    if hasattr(sim_matrix, 'toarray'):
+        sim_dense = sim_matrix.toarray()
+    elif hasattr(sim_matrix, 'A'):
+        sim_dense = np.asarray(sim_matrix.A)
+    else:
+        sim_dense = np.asarray(sim_matrix)
+
+    retrievals = {}
+    for i in range(n_total):
+        if not fp_mask[i]:
+            retrievals[all_indices[i]] = []
+
+    processed = 0
+    for batch_start in range(0, n_with_fp, batch_size):
+        batch_end = min(batch_start + batch_size, n_with_fp)
+        batch_pos = fp_positions[batch_start:batch_end]
+        b_size = len(batch_pos)
+
+        b_d1 = d1_sim_idx[batch_pos]
+        b_d2 = d2_sim_idx[batch_pos]
+
+        s_d1_c1 = sim_dense[b_d1][:, cand_d1]
+        s_d2_c2 = sim_dense[b_d2][:, cand_d2]
+        s_d1_c2 = sim_dense[b_d1][:, cand_d2]
+        s_d2_c1 = sim_dense[b_d2][:, cand_d1]
+
+        pair_sim = np.maximum(
+            (s_d1_c1 + s_d2_c2) / 2.0,
+            (s_d1_c2 + s_d2_c1) / 2.0
+        )
+
+        for bi in range(b_size):
+            pos_in_fp = batch_start + bi
+            orig_idx = all_indices[batch_pos[bi]]
+            sims = pair_sim[bi].copy()
+            sims[pos_in_fp] = -1.0
+
+            top_n = min(top_k * 10, n_with_fp)
+            top_positions = np.argpartition(sims, -top_n)[-top_n:]
+            top_positions = top_positions[np.argsort(-sims[top_positions])]
+
+            selected = []
+            classes_seen = set()
+            for cp in top_positions:
+                if len(selected) >= top_k:
+                    break
+                lbl = cand_labels[cp]
+                if len(selected) >= top_k - min_diverse or lbl not in classes_seen:
+                    selected.append(int(cand_orig_idx[cp]))
+                    classes_seen.add(lbl)
+
+            if len(selected) < top_k:
+                for cp in top_positions:
+                    if int(cand_orig_idx[cp]) not in selected:
+                        selected.append(int(cand_orig_idx[cp]))
+                        if len(selected) >= top_k:
+                            break
+
+            retrievals[orig_idx] = selected
+
+        processed += b_size
+        if processed % 10000 < batch_size or batch_end == n_with_fp:
+            print(f"  Retrieval: {processed:,}/{n_with_fp:,} pairs with FP computed...")
+
+    n_with = sum(1 for v in retrievals.values() if v)
+    print(f"  Retrieval complete: {n_with:,}/{n_total:,} pairs have retrieved examples, "
+          f"{n_skip:,} skipped (no fingerprints)")
+    return retrievals
 
 
-def build_student_target_label_only(row: pd.Series) -> str:
-    """Target output for label-only baseline (Condition B)."""
-    return f"Classification: Y={row['label']} — \"{row['label_text']}\""
-
-
+# ── Main preparation pipeline ─────────────────────────────────────────
 
 def prepare_data(cfg: dict):
     logger = setup_logging("data_preparation")
     set_seed(cfg["project"]["seed"])
     ensure_dirs(cfg)
 
-    logger.info("Loading raw DrugBank DDI data …")
-    df = load_raw_data(cfg)
-    logger.info(f"  Total pairs : {len(df):,}")
-    logger.info(f"  Label range : {df['label'].min()} – {df['label'].max()}")
-    logger.info(f"  Unique labels: {df['label'].nunique()}")
+    proc_dir = Path(cfg["data"]["processed_dir"])
+    min_pairs = cfg["data"]["min_pairs_per_class"]
+    max_train = cfg["data"]["max_train_per_class"]
+    train_ratio = cfg["data"]["train_ratio"]
+    seed = cfg["project"]["seed"]
 
-    name_map = load_name_map(cfg)
-    logger.info(f"  Drug-name map covers {len(name_map)} drugs")
-    df = resolve_drug_names(df, name_map)
+    logger.info("Loading extracted data...")
+    interactions = []
+    with open(proc_dir / "interactions_full.jsonl") as f:
+        for line in f:
+            interactions.append(json.loads(line))
+    logger.info(f"  Total interaction pairs: {len(interactions):,}")
 
-    unique_drugs = set(df["drug1_id"]) | set(df["drug2_id"])
-    resolved = sum(1 for d in unique_drugs if d in name_map)
-    logger.info(f"  Unique drugs: {len(unique_drugs)}, resolved names: {resolved} "
-                f"({100*resolved/len(unique_drugs):.1f}%)")
+    raw_lm_path = proc_dir / "raw_label_map.json"
+    if raw_lm_path.exists():
+        with open(raw_lm_path) as f:
+            raw_label_map = {int(k): v for k, v in json.load(f).items()}
+        logger.info(f"  Raw label classes (from raw_label_map.json): {len(raw_label_map)}")
+    else:
+        with open(proc_dir / "label_map.json") as f:
+            raw_label_map = {int(k): v for k, v in json.load(f).items()}
+        with open(raw_lm_path, "w") as f:
+            json.dump({str(k): v for k, v in raw_label_map.items()}, f, indent=2)
+        logger.info(f"  Raw label classes: {len(raw_label_map)} (backed up to raw_label_map.json)")
 
-    label_map = build_label_map(df)
-    df["label_text"] = df.apply(
-        lambda r: fill_template(label_map[r["label"]], r["drug1_name"], r["drug2_name"]),
-        axis=1,
+    with open(proc_dir / "drug_profiles.json") as f:
+        profiles = json.load(f)
+    logger.info(f"  Drug profiles: {len(profiles):,}")
+
+    with open(proc_dir / "severity_map.json") as f:
+        severity_map = json.load(f)
+    logger.info(f"  Severity labels: {len(severity_map):,}")
+
+    # Step 1: Filter to classes with >= min_pairs
+    label_counts = Counter(ix["label"] for ix in interactions)
+    kept_labels = {lbl for lbl, cnt in label_counts.items() if cnt >= min_pairs}
+    filtered = [ix for ix in interactions if ix["label"] in kept_labels]
+    logger.info(f"  After filtering (>= {min_pairs} pairs): "
+                f"{len(kept_labels)} classes, {len(filtered):,} pairs")
+
+    # Step 1b: Remove pairs where EITHER drug lacks useful pharmacological info.
+    # Both drugs must have at least one of: description, mechanism, enzymes, targets, transporters.
+    # This prevents the teacher from hallucinating mechanisms for unknown drugs.
+    useful_fields = ["description", "mechanism_of_action", "enzymes", "targets", "transporters"]
+    before_quality = len(filtered)
+    quality_filtered = []
+    for ix in filtered:
+        p1 = profiles.get(ix["drug1_id"], {})
+        p2 = profiles.get(ix["drug2_id"], {})
+        d1_has = p1 and any(p1.get(f) for f in useful_fields)
+        d2_has = p2 and any(p2.get(f) for f in useful_fields)
+        if d1_has and d2_has:
+            quality_filtered.append(ix)
+    n_removed = before_quality - len(quality_filtered)
+    filtered = quality_filtered
+    logger.info(f"  Profile quality filter: removed {n_removed:,} pairs "
+                f"(at least one drug missing description/mechanism/enzymes/targets/transporters)")
+    logger.info(f"  Remaining: {len(filtered):,} pairs")
+
+    # Re-check class counts after quality filter -- some classes may now be below min_pairs
+    label_counts_post = Counter(ix["label"] for ix in filtered)
+    dropped_classes = {lbl for lbl in kept_labels if label_counts_post.get(lbl, 0) < min_pairs}
+    if dropped_classes:
+        kept_labels -= dropped_classes
+        filtered = [ix for ix in filtered if ix["label"] in kept_labels]
+        logger.info(f"  Dropped {len(dropped_classes)} classes below {min_pairs} after quality filter")
+        logger.info(f"  Final: {len(kept_labels)} classes, {len(filtered):,} pairs")
+
+    # Step 2: Remap labels to contiguous IDs (1..N)
+    old_to_new = {}
+    new_label_map = {}
+    for new_id, (old_id, template) in enumerate(
+        sorted([(lbl, raw_label_map[lbl]) for lbl in kept_labels],
+               key=lambda x: -label_counts[x[0]]),
+        start=1,
+    ):
+        old_to_new[old_id] = new_id
+        new_label_map[new_id] = template
+
+    for ix in filtered:
+        ix["label"] = old_to_new[ix["label"]]
+
+    # Step 3: Build coarse category mapping
+    coarse_map = {}
+    for label_id, template in new_label_map.items():
+        coarse_map[label_id] = categorize_interaction(template)
+
+    coarse_counts = Counter(coarse_map.values())
+    logger.info(f"  Coarse categories: {len(coarse_counts)}")
+    for cat, cnt in coarse_counts.most_common():
+        logger.info(f"    {cat}: {cnt} fine-grained classes")
+
+    # Step 4: Fill label_text with real drug names
+    for ix in filtered:
+        template = new_label_map[ix["label"]]
+        ix["label_text"] = template.replace("#Drug1", ix["drug1_name"]).replace("#Drug2", ix["drug2_name"])
+        ix["coarse_category"] = coarse_map[ix["label"]]
+
+    # Step 5: Attach severity labels
+    severity_attached = 0
+    for ix in filtered:
+        pair_key = "_".join(sorted([ix["drug1_id"], ix["drug2_id"]]))
+        sev = severity_map.get(pair_key, "Unknown")
+        if sev in ("Major", "Moderate", "Minor"):
+            ix["severity"] = sev
+            severity_attached += 1
+        else:
+            ix["severity"] = "Unknown"
+    logger.info(f"  Severity attached: {severity_attached:,} / {len(filtered):,} "
+                f"({100*severity_attached/len(filtered):.1f}%)")
+
+    # Step 6: Stratified 80/20 split
+    df = pd.DataFrame(filtered)
+    train_df, test_df = train_test_split(
+        df, train_size=train_ratio, random_state=seed, stratify=df["label"],
     )
-    df["category"] = df["label_text_template"].apply(categorize_interaction)
+    train_df = train_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+    logger.info(f"  Split: train={len(train_df):,}, test={len(test_df):,}")
 
-    logger.info("Stratified train/test split …")
-    train_df, test_df = stratified_split(df, cfg["data"]["train_ratio"], cfg["project"]["seed"])
-    logger.info(f"  Train: {len(train_df):,}  |  Test: {len(test_df):,}")
+    # Step 7: Per-class training cap
+    capped_parts = []
+    rng = np.random.RandomState(seed)
+    for label in sorted(train_df["label"].unique()):
+        group = train_df[train_df["label"] == label]
+        if len(group) > max_train:
+            group = group.sample(n=max_train, random_state=rng)
+        capped_parts.append(group)
+    train_df = pd.concat(capped_parts, ignore_index=True)
+    train_df = train_df.sample(frac=1.0, random_state=rng).reset_index(drop=True)
+    logger.info(f"  After per-class cap ({max_train}): {len(train_df):,} training pairs")
 
-    out = Path(cfg["data"]["processed_dir"])
-    train_df.to_json(out / "train.jsonl", orient="records", lines=True)
-    test_df.to_json(out / "test.jsonl", orient="records", lines=True)
-    with open(out / "label_map.json", "w") as f:
-        json.dump(label_map, f, indent=2)
-    logger.info(f"Saved processed data to {out}")
-    return train_df, test_df, label_map
+    # Step 8: Log distribution stats
+    train_counts = train_df["label"].value_counts()
+    test_counts = test_df["label"].value_counts()
+    logger.info(f"  Training class distribution:")
+    logger.info(f"    Min: {train_counts.min()}, Max: {train_counts.max()}, "
+                f"Median: {train_counts.median():.0f}")
+    logger.info(f"  Test class distribution:")
+    logger.info(f"    Min: {test_counts.min()}, Max: {test_counts.max()}, "
+                f"Median: {test_counts.median():.0f}")
+
+    sev_train = train_df[train_df["severity"] != "Unknown"]
+    sev_test = test_df[test_df["severity"] != "Unknown"]
+    logger.info(f"  Severity-labeled: train={len(sev_train):,}, test={len(sev_test):,}")
+
+    # Save outputs
+    train_df.to_json(proc_dir / "train.jsonl", orient="records", lines=True)
+    test_df.to_json(proc_dir / "test.jsonl", orient="records", lines=True)
+
+    with open(proc_dir / "label_map.json", "w") as f:
+        json.dump(new_label_map, f, indent=2)
+
+    with open(proc_dir / "coarse_category_map.json", "w") as f:
+        json.dump(coarse_map, f, indent=2)
+
+    logger.info(f"  Saved train.jsonl ({len(train_df):,} pairs)")
+    logger.info(f"  Saved test.jsonl ({len(test_df):,} pairs)")
+    logger.info(f"  Saved label_map.json ({len(new_label_map)} classes)")
+    logger.info(f"  Saved coarse_category_map.json ({len(coarse_map)} mappings)")
+
+    # Step 9: Precompute few-shot retrievals for training set
+    logger.info("Precomputing few-shot retrievals for training pairs...")
+    fp_path = proc_dir / "drug_fingerprints.pkl"
+    sim_path = proc_dir / "drug_similarity_matrix.npz"
+    id_path = proc_dir / "drug_id_order.json"
+
+    if fp_path.exists() and sim_path.exists() and id_path.exists():
+        with open(fp_path, "rb") as f:
+            fingerprints = pickle.load(f)
+        sim_data = np.load(sim_path)
+        sim_matrix = sim_data["matrix"]
+        with open(id_path) as f:
+            drug_id_order = json.load(f)
+
+        top_k = cfg.get("retrieval", {}).get("top_k", 5)
+        min_diverse = cfg.get("retrieval", {}).get("min_diverse_classes", 2)
+
+        train_retrievals = precompute_retrievals(
+            train_df, profiles, drug_id_order, sim_matrix, fingerprints,
+            top_k=top_k, min_diverse=min_diverse, seed=seed,
+        )
+
+        retrieval_out = {}
+        for idx, selected_indices in train_retrievals.items():
+            examples = []
+            for sel_idx in selected_indices:
+                sel_row = train_df.iloc[sel_idx] if sel_idx < len(train_df) else None
+                if sel_row is not None:
+                    examples.append({
+                        "drug1_id": sel_row["drug1_id"],
+                        "drug2_id": sel_row["drug2_id"],
+                        "drug1_name": sel_row["drug1_name"],
+                        "drug2_name": sel_row["drug2_name"],
+                        "label": int(sel_row["label"]),
+                        "label_text": sel_row["label_text"],
+                        "severity": sel_row.get("severity", "Unknown"),
+                    })
+            retrieval_out[str(idx)] = examples
+
+        with open(proc_dir / "retrieved_examples_train.json", "w") as f:
+            json.dump(retrieval_out, f)
+        logger.info(f"  Saved retrieved_examples_train.json ({len(retrieval_out):,} entries)")
+    else:
+        logger.warning("Fingerprint/similarity files not found. Skipping retrieval precomputation.")
+
+    logger.info("Data preparation complete.")
+    return train_df, test_df, new_label_map
+
+
+def precompute_test_retrievals(cfg: dict):
+    """Precompute few-shot retrievals for test set using training candidates."""
+    logger = setup_logging("test_retrieval")
+    proc_dir = Path(cfg["data"]["processed_dir"])
+
+    train_df = pd.read_json(proc_dir / "train.jsonl", lines=True)
+    test_df = pd.read_json(proc_dir / "test.jsonl", lines=True)
+
+    fp_path = proc_dir / "drug_fingerprints.pkl"
+    sim_path = proc_dir / "drug_similarity_matrix.npz"
+    id_path = proc_dir / "drug_id_order.json"
+
+    if not (fp_path.exists() and sim_path.exists() and id_path.exists()):
+        logger.error("Fingerprint/similarity files not found. Run prepare_data first.")
+        return
+
+    with open(fp_path, "rb") as f:
+        fingerprints = pickle.load(f)
+    sim_data = np.load(sim_path)
+    sim_matrix = sim_data["matrix"]
+    with open(id_path) as f:
+        drug_id_order = json.load(f)
+
+    id_to_idx = {did: i for i, did in enumerate(drug_id_order)}
+    top_k = cfg.get("retrieval", {}).get("top_k", 5)
+    min_diverse = cfg.get("retrieval", {}).get("min_diverse_classes", 2)
+    batch_size = cfg.get("retrieval", {}).get("test_retrieval_batch_size", 128)
+
+    sim_dense = sim_matrix
+    if hasattr(sim_matrix, 'toarray'):
+        sim_dense = sim_matrix.toarray()
+    elif hasattr(sim_matrix, 'A'):
+        sim_dense = np.asarray(sim_matrix.A)
+    else:
+        sim_dense = np.asarray(sim_matrix)
+
+    train_d1_idx = np.array([id_to_idx.get(r["drug1_id"], -1) for _, r in train_df.iterrows()], dtype=np.int32)
+    train_d2_idx = np.array([id_to_idx.get(r["drug2_id"], -1) for _, r in train_df.iterrows()], dtype=np.int32)
+    train_fp_mask = (train_d1_idx >= 0) & (train_d2_idx >= 0)
+    train_labels = np.array(train_df["label"].tolist())
+
+    cand_d1 = train_d1_idx[train_fp_mask]
+    cand_d2 = train_d2_idx[train_fp_mask]
+    cand_labels = train_labels[train_fp_mask]
+    cand_orig_idx = np.array(train_df.index.tolist())[train_fp_mask]
+    if len(cand_d1) == 0:
+        logger.error("No fingerprint-backed training candidates; cannot build test retrievals.")
+        out_path = proc_dir / "retrieved_examples_test.json"
+        with open(out_path, "w") as f:
+            json.dump({}, f)
+        return
+
+    test_d1_idx = np.array([id_to_idx.get(r["drug1_id"], -1) for _, r in test_df.iterrows()], dtype=np.int32)
+    test_d2_idx = np.array([id_to_idx.get(r["drug2_id"], -1) for _, r in test_df.iterrows()], dtype=np.int32)
+    test_fp_mask = (test_d1_idx >= 0) & (test_d2_idx >= 0)
+    test_indices = np.array(test_df.index.tolist())
+
+    n_total = len(test_df)
+    n_with_fp = int(test_fp_mask.sum())
+    n_skip = n_total - n_with_fp
+    logger.info(
+        f"Test pairs: {n_total:,} | with fingerprints: {n_with_fp:,} | "
+        f"without: {n_skip:,} | train candidates: {len(cand_d1):,}"
+    )
+
+    retrieval_out = {str(idx): [] for idx in test_indices}
+    fp_positions = np.where(test_fp_mask)[0]
+    processed = 0
+
+    for batch_start in range(0, n_with_fp, batch_size):
+        batch_end = min(batch_start + batch_size, n_with_fp)
+        batch_pos = fp_positions[batch_start:batch_end]
+        b_size = len(batch_pos)
+
+        b_d1 = test_d1_idx[batch_pos]
+        b_d2 = test_d2_idx[batch_pos]
+
+        s_d1_c1 = sim_dense[b_d1][:, cand_d1]
+        s_d2_c2 = sim_dense[b_d2][:, cand_d2]
+        s_d1_c2 = sim_dense[b_d1][:, cand_d2]
+        s_d2_c1 = sim_dense[b_d2][:, cand_d1]
+
+        pair_sim = np.maximum(
+            (s_d1_c1 + s_d2_c2) / 2.0,
+            (s_d1_c2 + s_d2_c1) / 2.0,
+        )
+
+        top_n = min(top_k * 10, len(cand_d1))
+        for bi in range(b_size):
+            sims = pair_sim[bi]
+            top_positions = np.argpartition(sims, -top_n)[-top_n:]
+            top_positions = top_positions[np.argsort(-sims[top_positions])]
+
+            selected = []
+            classes_seen = set()
+            for cp in top_positions:
+                if len(selected) >= top_k:
+                    break
+                lbl = cand_labels[cp]
+                if len(selected) >= top_k - min_diverse or lbl not in classes_seen:
+                    sel_idx = int(cand_orig_idx[cp])
+                    sel_row = train_df.iloc[sel_idx]
+                    selected.append({
+                        "drug1_id": sel_row["drug1_id"],
+                        "drug2_id": sel_row["drug2_id"],
+                        "drug1_name": sel_row["drug1_name"],
+                        "drug2_name": sel_row["drug2_name"],
+                        "label": int(sel_row["label"]),
+                        "label_text": sel_row.get("label_text", ""),
+                        "severity": sel_row.get("severity", "Unknown"),
+                    })
+                    classes_seen.add(lbl)
+
+            retrieval_out[str(int(test_indices[batch_pos[bi]]))] = selected
+
+        processed += b_size
+        if processed % 10000 < b_size or batch_end == n_with_fp:
+            logger.info(f"  Test retrieval: {processed:,}/{n_with_fp:,} with-fp pairs")
+
+    out_path = proc_dir / "retrieved_examples_test.json"
+    with open(out_path, "w") as f:
+        json.dump(retrieval_out, f)
+    logger.info(f"Saved {out_path} ({len(retrieval_out):,} entries)")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--test-retrieval", action="store_true",
+                        help="Only precompute test set retrievals")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    if args.test_retrieval:
+        precompute_test_retrievals(cfg)
+    else:
+        prepare_data(cfg)

@@ -1,18 +1,25 @@
 """
+Phase 4 – Multi-task evaluation for DDI CoT Distillation V3.
 
-Classification : Macro/Micro F1, accuracy, per-category
-Reasoning      : BERTScore, ROUGE-L, step structure, mechanism coverage
-Calibration    : Expected Calibration Error (ECE), reliability diagram
-Prompt         : Robustness across paraphrased prompts
-Efficiency     : Tokens/sec, latency, VRAM
-Two-stage      : Real D_real inference (reasoning → classification)
-Judge          : LLM-as-a-judge with multi-dimensional rubric
+Tasks:
+  1. Fine-grained classification (150 classes): Macro/Micro F1, accuracy
+  2. Severity prediction (3-class): on DDInter-labeled subset
+  3. Coarse category classification (12 categories): post-hoc mapping
+  4. Mechanism entity extraction: precision/recall vs DrugBank ground truth
+
+Reasoning quality:
+  - BERTScore, ROUGE-L against teacher traces
+  - ECE (Expected Calibration Error)
+  - Prompt robustness (3 paraphrased variants)
+
+Supports JSONL-based inference resume for crash recovery.
 """
 
 import os
 import re
 import gc
 import json
+import logging
 import time
 import torch
 import numpy as np
@@ -21,824 +28,1038 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
-from collections import Counter
-from sklearn.metrics import f1_score, accuracy_score
-
-from src.utils import (
-    load_config, setup_logging, set_seed, ensure_dirs,
-    categorize_interaction, LABEL_CATEGORY_GROUPS,
+from collections import Counter, defaultdict
+from sklearn.metrics import (
+    f1_score, accuracy_score, classification_report, confusion_matrix,
 )
+
+from src.utils import load_config, setup_logging, set_seed, ensure_dirs
 from src.data_preparation import SYSTEM_PROMPT, build_student_input
 
 
-
+# ── Label / severity / entity extraction from output ──────────────────
 
 def extract_label(text: str) -> int:
-    """Extract predicted label from model output. Prefers the LAST match
-    to handle cases where the model mentions labels in reasoning."""
     matches = re.findall(r"Y\s*=\s*(\d+)", text)
     if matches:
         return int(matches[-1])
     m = re.search(r"Classification\s*:\s*(\d+)", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"[Tt]ype\s*[:=]\s*(\d+)", text)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"[Ll]abel\s*[:=]\s*(\d+)", text)
-    if m:
-        return int(m.group(1))
-    return -1
+    return int(m.group(1)) if m else -1
 
 
+def extract_severity(text: str) -> str:
+    m = re.search(r"Severity\s*:\s*(Major|Moderate|Minor|Unknown)", text, re.IGNORECASE)
+    return m.group(1).capitalize() if m else "Unknown"
+
+
+MECH_ENTITY_PATTERN = re.compile(
+    r"(CYP\d[A-Z]\d{1,2}|CYP\d+|P-glycoprotein|P-gp|OATP\w+|OCT\d|"
+    r"BCRP|MRP\d|MATE\d|UGT\w+|SULT\w+|NAT\d|"
+    r"[A-Z]{2,4}\d?[A-Z]?\d?\s+receptor|"
+    r"serotonin|dopamine|norepinephrine|GABA|glutamate|acetylcholine|"
+    r"beta-\d|alpha-\d|mu-opioid|kappa-opioid|"
+    r"MAO-[AB]|COX-[12]|PDE\d|HMGCR|ACE)",
+    re.IGNORECASE,
+)
+
+
+def extract_mechanism_entities(text: str) -> set[str]:
+    return {m.upper() for m in MECH_ENTITY_PATTERN.findall(text)}
+
+
+# ── Prediction generation with resume ─────────────────────────────────
 
 def predict_finetuned(cfg: dict, checkpoint_dir: str, condition_name: str,
-                      custom_prompt_fn=None):
-    """Run inference with LoRA-tuned student model on the test set."""
+                      test_path: str = None):
+    """Generate predictions for all test pairs with JSONL resume."""
     from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
 
     logger = setup_logging(f"eval_{condition_name}")
     set_seed(cfg["project"]["seed"])
 
-    test_path = os.path.join(cfg["data"]["processed_dir"], "test.jsonl")
+    processed = cfg["data"]["processed_dir"]
+    if test_path is None:
+        test_path = os.path.join(processed, "test.jsonl")
     test_df = pd.read_json(test_path, lines=True)
 
-    base_model = cfg["student"]["model_name"]
-    logger.info(f"Loading {base_model} + LoRA from {checkpoint_dir}")
+    with open(os.path.join(processed, "drug_profiles.json")) as f:
+        profiles = json.load(f)
+
+    retrieved = {}
+    retr_path = os.path.join(processed, "retrieved_examples_test.json")
+    if os.path.exists(retr_path):
+        with open(retr_path) as f:
+            raw = json.load(f)
+        for k, v in raw.items():
+            retrieved[int(k)] = v
+        logger.info(f"  Loaded {len(retrieved):,} test retrievals")
+    else:
+        logger.warning("  No retrieved_examples_test.json found -- prompts will lack few-shot examples")
+
+    results_dir = os.path.join(cfg["project"]["output_dir"], "results")
+    os.makedirs(results_dir, exist_ok=True)
+    pred_file = os.path.join(results_dir, f"predictions_{condition_name}.jsonl")
+
+    done = set()
+    if os.path.exists(pred_file):
+        with open(pred_file) as f:
+            for line in f:
+                try:
+                    done.add(json.loads(line)["idx"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+    remaining = test_df[~test_df.index.isin(done)]
+    logger.info(f"Condition: {condition_name}")
+    logger.info(f"  Test pairs: {len(test_df):,}, done: {len(done):,}, "
+                f"remaining: {len(remaining):,}")
+
+    if len(remaining) == 0:
+        logger.info("All predictions complete.")
+        return pred_file
+
+    ecfg = cfg["evaluation"]
+    scfg = cfg["student"]
+    model_name = scfg["model_name"]
+    lora_r = int(scfg.get("lora", {}).get("r", 64))
+    tp_size = int(os.environ.get("VLLM_TP_SIZE", ecfg.get("tensor_parallel_size", 1)))
+    logger.info(f"  vLLM tensor_parallel_size={tp_size}")
 
     llm = LLM(
-        model=base_model, dtype="bfloat16", max_model_len=4096,
-        gpu_memory_utilization=0.85, enable_lora=True,
-        max_lora_rank=cfg["student"]["lora"]["r"],
+        model=model_name,
+        enable_lora=True,
+        max_lora_rank=lora_r,
+        tensor_parallel_size=tp_size,
+        dtype=scfg["dtype"],
+        max_model_len=scfg["max_length"],
+        gpu_memory_utilization=0.85,
         trust_remote_code=True,
     )
-    tokenizer = llm.get_tokenizer()
-    lora_req = LoRARequest(condition_name, 1, checkpoint_dir)
-
-    params = SamplingParams(
-        temperature=0.1, top_p=0.9,
-        max_tokens=cfg["evaluation"]["max_new_tokens"],
-    )
-
-    prompt_fn = custom_prompt_fn or _default_prompt_fn
-    prompts = [prompt_fn(row, tokenizer) for _, row in test_df.iterrows()]
-
-    logger.info(f"Inference on {len(prompts):,} test pairs …")
-    batch_size = cfg["evaluation"]["batch_size"]
-    all_outputs = []
-    total_tokens = 0
-    t0 = time.time()
-
-    for i in range(0, len(prompts), batch_size):
-        batch = prompts[i:i + batch_size]
-        outs = llm.generate(batch, params, lora_request=lora_req)
-        all_outputs.extend(outs)
-        total_tokens += sum(len(o.outputs[0].token_ids) for o in outs)
-        logger.info(f"  {min(i+batch_size, len(prompts))}/{len(prompts)}")
-
-    elapsed = time.time() - t0
-    tps = total_tokens / elapsed if elapsed > 0 else 0
-
-    results = []
-    for (_, row), out in zip(test_df.iterrows(), all_outputs):
-        text = out.outputs[0].text.strip()
-        results.append({
-            "drug1_id": row["drug1_id"],
-            "drug2_id": row["drug2_id"],
-            "drug1_name": row.get("drug1_name", row["drug1_id"]),
-            "drug2_name": row.get("drug2_name", row["drug2_id"]),
-            "true_label": int(row["label"]),
-            "pred_label": extract_label(text),
-            "response": text,
-        })
-
-    out_dir = os.path.join(cfg["project"]["output_dir"], "results")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{condition_name}_predictions.jsonl")
-    with open(out_path, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-
-    logger.info(f"Throughput: {tps:.1f} tok/s | Elapsed: {elapsed:.1f}s | → {out_path}")
-
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return out_path, {"tokens_per_sec": tps, "elapsed_sec": elapsed,
-                      "total_tokens": total_tokens}
-
-
-def _default_prompt_fn(row, tokenizer):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_student_input(row)},
-    ]
-    return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-
-
-def compute_classification_metrics(predictions_path: str, label_map: dict,
-                                   condition_name: str) -> dict:
-    logger = setup_logging(f"metrics_{condition_name}")
-    records = _load_records(predictions_path)
-
-    trues = [r["true_label"] for r in records]
-    preds = [r["pred_label"] for r in records]
-    valid = [(t, p) for t, p in zip(trues, preds) if p >= 0]
-
-    if not valid:
-        return {"condition": condition_name, "macro_f1": 0, "micro_f1": 0,
-                "accuracy": 0, "valid_pct": 0}
-
-    t_v, p_v = zip(*valid)
-    macro = f1_score(t_v, p_v, average="macro", zero_division=0)
-    micro = f1_score(t_v, p_v, average="micro", zero_division=0)
-    acc = accuracy_score(t_v, p_v)
-    valid_pct = 100 * len(valid) / len(trues)
-
-    logger.info(f"{condition_name}: Macro F1={macro:.4f} | Micro F1={micro:.4f} | "
-                f"Acc={acc:.4f} | Valid={valid_pct:.1f}%")
-
-    cat_scores = {}
-    for t, p in valid:
-        template = label_map.get(t, "")
-        cat = categorize_interaction(template)
-        if cat not in cat_scores:
-            cat_scores[cat] = {"true": [], "pred": []}
-        cat_scores[cat]["true"].append(t)
-        cat_scores[cat]["pred"].append(p)
-
-    cat_f1 = {}
-    for cat, vals in cat_scores.items():
-        cat_f1[cat] = float(f1_score(vals["true"], vals["pred"],
-                                     average="micro", zero_division=0))
-
-    return {
-        "condition": condition_name,
-        "macro_f1": float(macro), "micro_f1": float(micro),
-        "accuracy": float(acc), "valid_pct": float(valid_pct),
-        "category_f1": cat_f1,
-    }
-
-
-
-def evaluate_reasoning_quality(predictions_path: str, condition_name: str,
-                               teacher_traces_path: str = None) -> dict:
-    """Evaluate reasoning: structure, mechanism, BERTScore, ROUGE."""
-    logger = setup_logging(f"reasoning_{condition_name}")
-    records = _load_records(predictions_path)
-
-    # Structure and mechanism analysis
-    has_steps, has_mechanism = 0, 0
-    step_counts, word_counts = [], []
-    for r in records:
-        text = r.get("response", "")
-        steps = len(re.findall(r"[Ss]tep\s*\d", text))
-        if steps > 0:
-            has_steps += 1
-            step_counts.append(steps)
-        if re.search(r"(CYP|enzyme|receptor|inhibit|induc|metabol|pathway|transporter|P-gp|clearance)",
-                     text, re.IGNORECASE):
-            has_mechanism += 1
-        word_counts.append(len(text.split()))
-
-    n = len(records)
-    metrics = {
-        "condition": condition_name,
-        "total": n,
-        "step_structure_pct": 100 * has_steps / n if n else 0,
-        "mechanism_mention_pct": 100 * has_mechanism / n if n else 0,
-        "avg_steps": float(np.mean(step_counts)) if step_counts else 0,
-        "avg_word_count": float(np.mean(word_counts)) if word_counts else 0,
-    }
-
-    # BERTScore and ROUGE against teacher reasoning
-    if teacher_traces_path and os.path.exists(teacher_traces_path):
-        teacher_map = _load_teacher_map(teacher_traces_path)
-        student_texts, teacher_texts = [], []
-        for r in records:
-            key = f"{r['drug1_id']}_{r['drug2_id']}"
-            if key in teacher_map:
-                s_reason = _extract_reasoning(r.get("response", ""))
-                t_reason = _extract_reasoning(teacher_map[key])
-                if s_reason and t_reason:
-                    student_texts.append(s_reason)
-                    teacher_texts.append(t_reason)
-
-        if student_texts:
-            logger.info(f"Computing BERTScore on {len(student_texts):,} pairs …")
-            try:
-                from bert_score import score as bertscore_fn
-                P, R, F1 = bertscore_fn(
-                    student_texts, teacher_texts,
-                    model_type="microsoft/deberta-xlarge-mnli",
-                    batch_size=32, verbose=False,
-                )
-                metrics["bertscore_precision"] = float(P.mean())
-                metrics["bertscore_recall"] = float(R.mean())
-                metrics["bertscore_f1"] = float(F1.mean())
-                logger.info(f"BERTScore F1: {metrics['bertscore_f1']:.4f}")
-            except ImportError:
-                logger.warning("bert-score not installed, skipping BERTScore")
-
-            logger.info(f"Computing ROUGE-L on {len(student_texts):,} pairs …")
-            try:
-                from rouge_score import rouge_scorer
-                scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-                rouge_scores = [scorer.score(t, s)["rougeL"].fmeasure
-                                for s, t in zip(student_texts, teacher_texts)]
-                metrics["rouge_l"] = float(np.mean(rouge_scores))
-                logger.info(f"ROUGE-L: {metrics['rouge_l']:.4f}")
-            except ImportError:
-                logger.warning("rouge-score not installed, skipping ROUGE")
-
-    logger.info(f"{condition_name}: steps={metrics['step_structure_pct']:.1f}% | "
-                f"mechanism={metrics['mechanism_mention_pct']:.1f}%")
-    return metrics
-
-
-def _extract_reasoning(text: str) -> str:
-    """Extract reasoning portion (before Classification: line)."""
-    return re.sub(r"\n*Classification\s*:.*$", "", text,
-                  flags=re.IGNORECASE).strip()
-
-
-def _load_teacher_map(path: str) -> dict:
-    teacher = {}
-    with open(path) as f:
-        for line in f:
-            rec = json.loads(line)
-            key = f"{rec['drug1_id']}_{rec['drug2_id']}"
-            teacher[key] = rec.get("teacher_cot", rec.get("cot", ""))
-    return teacher
-
-
-def compute_ece(predictions_path: str, cfg: dict, condition_name: str,
-                fig_dir: str = None) -> dict:
-    """Compute Expected Calibration Error from token log-probabilities.
-    Requires predictions with 'confidence' field (added during inference)."""
-    logger = setup_logging(f"ece_{condition_name}")
-    records = _load_records(predictions_path)
-
-    confidences = [r.get("confidence", -1) for r in records]
-    if all(c < 0 for c in confidences):
-        logger.info("No confidence scores available, computing from label frequency proxy")
-        return _compute_ece_frequency_proxy(records, cfg, condition_name, fig_dir)
-
-    n_bins = cfg["evaluation"].get("ece_n_bins", 15)
-    valid = [(r["true_label"] == r["pred_label"], r["confidence"])
-             for r in records if r["pred_label"] >= 0 and r.get("confidence", -1) >= 0]
-
-    if not valid:
-        return {"condition": condition_name, "ece": -1}
-
-    corrects, confs = zip(*valid)
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    bin_data = []
-
-    for i in range(n_bins):
-        lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
-        mask = [(lo <= c < hi) for c in confs]
-        n_bin = sum(mask)
-        if n_bin == 0:
-            continue
-        bin_acc = sum(c for c, m in zip(corrects, mask) if m) / n_bin
-        bin_conf = sum(c for c, m in zip(confs, mask) if m) / n_bin
-        ece += (n_bin / len(valid)) * abs(bin_acc - bin_conf)
-        bin_data.append({"bin_mid": (lo + hi) / 2, "acc": bin_acc,
-                         "conf": bin_conf, "count": n_bin})
-
-    logger.info(f"{condition_name} ECE: {ece:.4f}")
-
-    if fig_dir:
-        _plot_reliability_diagram(bin_data, condition_name, fig_dir, ece)
-
-    return {"condition": condition_name, "ece": float(ece), "bins": bin_data}
-
-
-def _compute_ece_frequency_proxy(records, cfg, condition_name, fig_dir):
-    """Proxy ECE using prediction frequency as confidence."""
-    valid = [r for r in records if r["pred_label"] >= 0]
-    if not valid:
-        return {"condition": condition_name, "ece": -1}
-
-    pred_counts = Counter(r["pred_label"] for r in valid)
-    total = len(valid)
-    for r in valid:
-        r["confidence"] = pred_counts[r["pred_label"]] / total
-
-    n_bins = cfg["evaluation"].get("ece_n_bins", 15)
-    corrects = [r["true_label"] == r["pred_label"] for r in valid]
-    confs = [r["confidence"] for r in valid]
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    bin_data = []
-
-    for i in range(n_bins):
-        lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
-        idxs = [j for j, c in enumerate(confs) if lo <= c < hi]
-        if not idxs:
-            continue
-        bin_acc = sum(corrects[j] for j in idxs) / len(idxs)
-        bin_conf = sum(confs[j] for j in idxs) / len(idxs)
-        ece += (len(idxs) / len(valid)) * abs(bin_acc - bin_conf)
-        bin_data.append({"bin_mid": (lo + hi) / 2, "acc": bin_acc,
-                         "conf": bin_conf, "count": len(idxs)})
-
-    if fig_dir:
-        _plot_reliability_diagram(bin_data, condition_name, fig_dir, ece)
-
-    return {"condition": condition_name, "ece_proxy": float(ece), "bins": bin_data}
-
-
-def _plot_reliability_diagram(bin_data, condition_name, fig_dir, ece):
-    os.makedirs(fig_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(7, 6))
-    mids = [b["bin_mid"] for b in bin_data]
-    accs = [b["acc"] for b in bin_data]
-    ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfect calibration")
-    ax.bar(mids, accs, width=0.06, alpha=0.7, label=f"{condition_name} (ECE={ece:.3f})")
-    ax.set_xlabel("Confidence")
-    ax.set_ylabel("Accuracy")
-    ax.set_title(f"Reliability Diagram — {condition_name}")
-    ax.legend()
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, f"reliability_{condition_name}.png"), dpi=150)
-    plt.close()
-
-
-
-PROMPT_VARIANTS = [
-    "Analyze the pharmacological interaction between these two drugs step-by-step and classify the interaction type.",
-    "Given the molecular structures below, describe the drug-drug interaction mechanism and provide the classification.",
-    "As a pharmacologist, examine these two drugs and their potential interaction. Explain your reasoning and classify.",
-]
-
-
-def evaluate_prompt_robustness(cfg: dict, checkpoint_dir: str,
-                               condition_name: str) -> dict:
-    """Test model with paraphrased prompts, measure F1 variance."""
-    from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
+    lora_req = LoRARequest("student", 1, checkpoint_dir)
 
-    logger = setup_logging(f"robustness_{condition_name}")
-    test_path = os.path.join(cfg["data"]["processed_dir"], "test.jsonl")
-    test_df = pd.read_json(test_path, lines=True)
-
-    n_variants = min(cfg["evaluation"].get("prompt_variants", 3), len(PROMPT_VARIANTS))
-    variants = PROMPT_VARIANTS[:n_variants]
-
-    base_model = cfg["student"]["model_name"]
-    llm = LLM(
-        model=base_model, dtype="bfloat16", max_model_len=4096,
-        gpu_memory_utilization=0.85, enable_lora=True,
-        max_lora_rank=cfg["student"]["lora"]["r"], trust_remote_code=True,
-    )
     tokenizer = llm.get_tokenizer()
-    lora_req = LoRARequest(condition_name, 1, checkpoint_dir)
-    params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=256)
+    params = SamplingParams(
+        temperature=0.1, top_p=0.95,
+        max_tokens=ecfg.get("max_new_tokens", 512),
+    )
 
-    all_f1s = []
-    for vi, variant_instruction in enumerate(variants):
+    batch_size = ecfg.get("batch_size", 64)
+    t_start = time.time()
+
+    for batch_start in range(0, len(remaining), batch_size):
+        batch = remaining.iloc[batch_start:batch_start + batch_size]
         prompts = []
-        for _, row in test_df.iterrows():
-            user_msg = (
-                f"Drug 1: {row['drug1_name']} ({row['drug1_id']})\n"
-                f"SMILES: {row['drug1_smiles']}\n"
-                f"Drug 2: {row['drug2_name']} ({row['drug2_id']})\n"
-                f"SMILES: {row['drug2_smiles']}\n\n"
-                f"{variant_instruction}"
-            )
+        for orig_idx, row in batch.iterrows():
+            retr_examples = retrieved.get(orig_idx)
+            user_msg = build_student_input(row, profiles, retr_examples)
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ]
-            prompts.append(tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            ))
+            try:
+                prompts.append(tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                ))
+            except TypeError:
+                prompts.append(tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                ))
 
-        batch_sz = cfg["evaluation"]["batch_size"]
-        preds = []
-        for i in range(0, len(prompts), batch_sz):
-            outs = llm.generate(prompts[i:i+batch_sz], params, lora_request=lora_req)
-            for out in outs:
-                preds.append(extract_label(out.outputs[0].text.strip()))
+        outputs = llm.generate(prompts, params, lora_request=lora_req)
 
-        y_true = test_df["label"].tolist()
-        valid = [(t, p) for t, p in zip(y_true, preds) if p >= 0]
-        if valid:
-            vt, vp = zip(*valid)
-            macro = f1_score(vt, vp, average="macro", zero_division=0)
-        else:
-            macro = 0.0
-        all_f1s.append(macro)
-        logger.info(f"  Variant {vi}: Macro F1={macro:.4f}")
+        with open(pred_file, "a") as f:
+            for (orig_idx, row), out in zip(batch.iterrows(), outputs):
+                text = out.outputs[0].text.strip()
+                pred_label = extract_label(text)
+                pred_severity = extract_severity(text)
+                pred_entities = list(extract_mechanism_entities(text))
+                f.write(json.dumps({
+                    "idx": int(orig_idx),
+                    "label": int(row["label"]),
+                    "pred_label": pred_label,
+                    "drug1_id": str(row.get("drug1_id", "")),
+                    "drug2_id": str(row.get("drug2_id", "")),
+                    "drug1_name": str(row.get("drug1_name", "")),
+                    "drug2_name": str(row.get("drug2_name", "")),
+                    "severity": str(row.get("severity", "Unknown")),
+                    "pred_severity": pred_severity,
+                    "pred_entities": pred_entities,
+                    "output": text,
+                }) + "\n")
+
+        n_done = len(done) + batch_start + len(batch)
+        if (batch_start // batch_size + 1) % 20 == 0:
+            elapsed = time.time() - t_start
+            rate = (batch_start + len(batch)) / elapsed
+            logger.info(f"  {n_done:,}/{len(test_df):,} | {rate:.1f} pairs/s")
 
     del llm
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    logger.info(f"  Predictions saved to {pred_file}")
+    return pred_file
 
-    mean_f1 = float(np.mean(all_f1s))
-    std_f1 = float(np.std(all_f1s))
-    sensitivity = std_f1 / mean_f1 if mean_f1 > 0 else float("inf")
 
-    logger.info(f"Prompt robustness: mean={mean_f1:.4f} std={std_f1:.4f} "
-                f"sensitivity={sensitivity:.4f}")
+def _iter_prediction_rows(pred_file: str, logger=None):
+    """Yield valid JSON prediction rows, skipping malformed lines safely."""
+    skipped = 0
+    with open(pred_file) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            yield obj
+    if skipped and logger is not None:
+        logger.warning(f"  Skipped {skipped} malformed prediction rows in {pred_file}")
+
+
+# ── Task 1: Fine-grained classification ──────────────────────────────
+
+def evaluate_classification(pred_file: str, label_map: dict, logger):
+    """Compute Macro/Micro F1, accuracy for 150-class classification."""
+    y_true, y_pred = [], []
+    n_total = 0
+    for obj in _iter_prediction_rows(pred_file, logger):
+        n_total += 1
+        if obj["pred_label"] >= 0:
+            y_true.append(obj["label"])
+            y_pred.append(obj["pred_label"])
+    n_parsed = len(y_true)
+    parse_rate = 100 * n_parsed / n_total if n_total else 0
+
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    micro_f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+
+    logger.info(f"  Classification (150-class):")
+    logger.info(f"    Parse rate: {parse_rate:.1f}% ({n_parsed}/{n_total})")
+    logger.info(f"    Macro F1:   {macro_f1:.4f}")
+    logger.info(f"    Micro F1:   {micro_f1:.4f}")
+    logger.info(f"    Accuracy:   {acc:.4f}")
 
     return {
-        "condition": condition_name,
-        "variant_f1s": all_f1s,
-        "mean_f1": mean_f1, "std_f1": std_f1,
-        "sensitivity_score": sensitivity,
+        "macro_f1": round(macro_f1, 4),
+        "micro_f1": round(micro_f1, 4),
+        "accuracy": round(acc, 4),
+        "parse_rate": round(parse_rate, 1),
+        "n_parsed": n_parsed,
+        "n_total": n_total,
     }
 
 
+# ── Task 2: Severity prediction ──────────────────────────────────────
 
-def predict_two_stage_real(cfg: dict, reasoning_checkpoint: str,
-                           classify_checkpoint: str = None,
-                           condition_name: str = "D_real",
-                           n_samples: int = 1) -> str:
-    """Two-stage inference: reasoning then classification, with self-consistency.
+def evaluate_severity(pred_file: str, logger):
+    """Evaluate severity prediction on DDInter-labeled subset."""
+    y_true, y_pred = [], []
+    sev_labels = {"Major": 0, "Moderate": 1, "Minor": 2}
 
-    The model generates reasoning sequentially followed by a classification.
-    The two stages are coupled within a single generation pass, meaning the
-    classification is explicitly conditioned on the preceding reasoning tokens.
+    for obj in _iter_prediction_rows(pred_file, logger):
+        gt_sev = obj.get("severity", "Unknown")
+        if gt_sev in sev_labels:
+            pred_sev = obj.get("pred_severity", "Unknown")
+            if pred_sev in sev_labels:
+                y_true.append(sev_labels[gt_sev])
+                y_pred.append(sev_labels[pred_sev])
 
-    n_samples=1  → Single generation per test pair (equivalent to C_seq).
-    n_samples>1  → Self-consistency: generate N diverse reasoning paths with
-                   higher temperature, extract the classification from each,
-                   and take majority vote.  This exploits reasoning diversity —
-                   something pure label-only models (B) cannot benefit from.
-    """
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
+    if not y_true:
+        logger.warning("  Severity: no DDInter-labeled predictions found")
+        return {}
 
-    logger = setup_logging(f"eval_{condition_name}")
-    set_seed(cfg["project"]["seed"])
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+    label_names = ["Major", "Moderate", "Minor"]
 
-    test_path = os.path.join(cfg["data"]["processed_dir"], "test.jsonl")
-    test_df = pd.read_json(test_path, lines=True)
+    logger.info(f"  Severity prediction ({len(y_true)} pairs):")
+    logger.info(f"    Macro F1:  {macro_f1:.4f}")
+    logger.info(f"    Accuracy:  {acc:.4f}")
 
-    base_model = cfg["student"]["model_name"]
-    lora_r = cfg["student"]["lora"]["r"]
-    batch_sz = cfg["evaluation"]["batch_size"]
-    max_tokens = cfg["evaluation"]["max_new_tokens"]
+    per_class = f1_score(y_true, y_pred, average=None, zero_division=0,
+                         labels=[0, 1, 2])
+    for i, name in enumerate(label_names):
+        logger.info(f"    {name}: F1={per_class[i]:.4f}")
 
-    llm = LLM(
-        model=base_model, dtype="bfloat16", max_model_len=4096,
-        gpu_memory_utilization=0.85, enable_lora=True,
-        max_lora_rank=lora_r, trust_remote_code=True,
-    )
-    tokenizer = llm.get_tokenizer()
-    lora_req = LoRARequest("reasoning", 1, reasoning_checkpoint)
-
-    prompts = [_default_prompt_fn(row, tokenizer) for _, row in test_df.iterrows()]
-
-    if n_samples == 1:
-        # Single pass — same as C_seq but saves reasoning + classification separately
-        logger.info(f"Single-pass two-stage on {len(prompts):,} pairs …")
-        params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=max_tokens)
-
-        all_outputs = []
-        for i in range(0, len(prompts), batch_sz):
-            outs = llm.generate(prompts[i:i+batch_sz], params, lora_request=lora_req)
-            all_outputs.extend(outs)
-            logger.info(f"  {min(i+batch_sz, len(prompts))}/{len(prompts)}")
-
-        results = []
-        for (_, row), out in zip(test_df.iterrows(), all_outputs):
-            text = out.outputs[0].text.strip()
-            reasoning = _extract_reasoning(text)
-            pred = extract_label(text)
-            results.append({
-                "drug1_id": row["drug1_id"],
-                "drug2_id": row["drug2_id"],
-                "drug1_name": row.get("drug1_name", row["drug1_id"]),
-                "drug2_name": row.get("drug2_name", row["drug2_id"]),
-                "true_label": int(row["label"]),
-                "pred_label": pred,
-                "response": reasoning,
-                "classification_response": text[len(reasoning):].strip(),
-            })
-
-    else:
-        # Self-consistency: N samples per pair, majority vote
-        logger.info(f"Self-consistency (n={n_samples}) on {len(prompts):,} pairs …")
-        params = SamplingParams(
-            temperature=0.7, top_p=0.95, max_tokens=max_tokens, n=n_samples,
-        )
-
-        all_multi_outputs = []
-        for i in range(0, len(prompts), batch_sz):
-            outs = llm.generate(prompts[i:i+batch_sz], params, lora_request=lora_req)
-            all_multi_outputs.extend(outs)
-            logger.info(f"  {min(i+batch_sz, len(prompts))}/{len(prompts)}")
-
-        results = []
-        agreement_counts = []
-        for (_, row), multi_out in zip(test_df.iterrows(), all_multi_outputs):
-            sample_labels = []
-            sample_texts = []
-            for sample in multi_out.outputs:
-                text = sample.text.strip()
-                sample_texts.append(text)
-                sample_labels.append(extract_label(text))
-
-            valid_labels = [l for l in sample_labels if l >= 0]
-            if valid_labels:
-                vote_counter = Counter(valid_labels)
-                pred, count = vote_counter.most_common(1)[0]
-                agreement_counts.append(count / len(valid_labels))
-            else:
-                pred = -1
-                agreement_counts.append(0.0)
-
-            # Pick the sample whose label matches the majority vote for reasoning
-            best_idx = 0
-            for idx, lbl in enumerate(sample_labels):
-                if lbl == pred:
-                    best_idx = idx
-                    break
-            best_text = sample_texts[best_idx]
-            reasoning = _extract_reasoning(best_text)
-
-            results.append({
-                "drug1_id": row["drug1_id"],
-                "drug2_id": row["drug2_id"],
-                "drug1_name": row.get("drug1_name", row["drug1_id"]),
-                "drug2_name": row.get("drug2_name", row["drug2_id"]),
-                "true_label": int(row["label"]),
-                "pred_label": pred,
-                "response": reasoning,
-                "classification_response": best_text[len(reasoning):].strip(),
-                "n_samples": n_samples,
-                "sample_labels": sample_labels,
-                "agreement": count / len(valid_labels) if valid_labels else 0.0,
-            })
-
-        avg_agreement = float(np.mean(agreement_counts))
-        logger.info(f"Self-consistency agreement: {avg_agreement:.3f} "
-                    f"(N={n_samples})")
-
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    out_dir = os.path.join(cfg["project"]["output_dir"], "results")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{condition_name}_predictions.jsonl")
-    with open(out_path, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-
-    valid = [(r["true_label"], r["pred_label"]) for r in results if r["pred_label"] >= 0]
-    if valid:
-        vt, vp = zip(*valid)
-        macro = f1_score(vt, vp, average="macro", zero_division=0)
-        micro = f1_score(vt, vp, average="micro", zero_division=0)
-        logger.info(f"{condition_name}: Macro F1={macro:.4f} | Micro F1={micro:.4f}")
-
-    logger.info(f"Saved to {out_path}")
-    return out_path
+    return {
+        "severity_macro_f1": round(macro_f1, 4),
+        "severity_accuracy": round(acc, 4),
+        "severity_n": len(y_true),
+        "per_class_f1": {name: round(per_class[i], 4) for i, name in enumerate(label_names)},
+    }
 
 
+# ── Task 3: Coarse category classification ───────────────────────────
+
+def evaluate_coarse(pred_file: str, coarse_map: dict, logger):
+    """Evaluate coarse category accuracy via label -> coarse mapping."""
+    y_true_coarse, y_pred_coarse = [], []
+    all_categories = sorted(set(coarse_map.values()))
+    cat_to_id = {c: i for i, c in enumerate(all_categories)}
+
+    for obj in _iter_prediction_rows(pred_file, logger):
+        if obj["pred_label"] < 0:
+            continue
+        gt_cat = coarse_map.get(str(obj["label"]))
+        pred_cat = coarse_map.get(str(obj["pred_label"]))
+        if gt_cat and pred_cat:
+            y_true_coarse.append(cat_to_id[gt_cat])
+            y_pred_coarse.append(cat_to_id[pred_cat])
+
+    if not y_true_coarse:
+        logger.warning("  Coarse: no valid predictions")
+        return {}
+
+    macro_f1 = f1_score(y_true_coarse, y_pred_coarse, average="macro",
+                        zero_division=0)
+    acc = accuracy_score(y_true_coarse, y_pred_coarse)
+
+    logger.info(f"  Coarse category ({len(all_categories)} categories):")
+    logger.info(f"    Macro F1:  {macro_f1:.4f}")
+    logger.info(f"    Accuracy:  {acc:.4f}")
+
+    return {
+        "coarse_macro_f1": round(macro_f1, 4),
+        "coarse_accuracy": round(acc, 4),
+        "n_categories": len(all_categories),
+    }
 
 
-JUDGE_SYSTEM_MSG = "You are a senior pharmacologist evaluating the quality of drug interaction explanations."
+# ── Task 4: Mechanism entity extraction ───────────────────────────────
 
-STUDENT_JUDGE_PROMPT = """You are a senior pharmacologist conducting a rigorous peer review. \
-A student model wrote the explanation below to reason about a drug-drug interaction. \
-Determine if this explanation demonstrates CORRECT pharmacological reasoning.
+def evaluate_entities(pred_file: str, profiles: dict, logger):
+    """Compare extracted entities against DrugBank ground truth."""
+    total_precision_num, total_precision_den = 0, 0
+    total_recall_num, total_recall_den = 0, 0
+    n_pairs = 0
 
-=== DRUG PAIR ===
-Drug 1: {drug1_name}
-Drug 2: {drug2_name}
-Known interaction: {label_text}
-
-=== STUDENT'S EXPLANATION ===
-{cot}
-
-=== SCORING CRITERIA (1-5, strict: 3=acceptable, 4=good, 5=excellent) ===
-
-1. DRUG_SPECIFICITY: Names specific enzymes, receptors, transporters for each drug?
-2. MECHANISM_ACCURACY: Mechanism is pharmacologically plausible and accurate?
-3. CAUSAL_CHAIN: Steps build logically toward the stated interaction?
-4. TEACHING_VALUE: Explanation teaches transferable reasoning?
-5. FACTUAL_ERRORS: Any errors or hallucinations? (1=major, 5=none)
-
-=== OUTPUT ===
-Brief analysis (2-4 sentences). Then scores, each on its own line:
-
-DRUG_SPECIFICITY: <score>
-MECHANISM_ACCURACY: <score>
-CAUSAL_CHAIN: <score>
-TEACHING_VALUE: <score>
-FACTUAL_ERRORS: <score>
-OVERALL: <score>
-VERDICT: <PASS if OVERALL >= 3, else FAIL>"""
-
-
-def judge_student_reasoning(cfg: dict, predictions_path: str,
-                            sample_size: int = 99999):
-    """Score student reasoning with judge models. Uses drug NAMES (not IDs)."""
-    from vllm import LLM, SamplingParams
-
-    logger = setup_logging("student_judge")
-    records = _load_records(predictions_path)
-
-    if sample_size < len(records):
-        import random
-        random.seed(cfg["project"]["seed"])
-        records = random.sample(records, sample_size)
-
-    label_map = _load_label_map(cfg)
-
-    res_dir = os.path.join(cfg["project"]["output_dir"], "results")
-    os.makedirs(res_dir, exist_ok=True)
-    all_judge_results = {}
-    BATCH_SIZE = 64
-
-    for jcfg in cfg["judge"]["models"]:
-        model_name = jcfg["model_name"]
-        short_name = model_name.split("/")[-1]
-        no_sys = jcfg.get("no_system_prompt", False)
-        m_temp = jcfg.get("temperature", 0.3)
-
-        score_path = os.path.join(res_dir, f"student_judge_scores_{short_name}.jsonl")
-        ckpt_path = score_path + ".ckpt"
-
-        scored = {}
-        if os.path.exists(ckpt_path):
-            with open(ckpt_path) as f:
-                for line in f:
-                    s = json.loads(line)
-                    scored[s["idx"]] = s
-            logger.info(f"Resuming {short_name}: {len(scored)} already scored")
-
-        remaining = []
-        for rec in records:
-            idx = f"{rec['drug1_id']}_{rec['drug2_id']}"
-            if idx not in scored:
-                remaining.append(rec)
-
-        if not remaining:
-            logger.info(f"{short_name}: all scored — skipping")
-            all_judge_results[short_name] = list(scored.values())
+    for obj in _iter_prediction_rows(pred_file, logger):
+        pred_ents = set(e.upper() for e in obj.get("pred_entities", []))
+        if not pred_ents:
             continue
 
-        logger.info(f"Loading judge: {model_name} ({len(remaining)} to score)")
+        gt_ents = set()
+        for did_key in ("drug1_id", "drug2_id"):
+            did = obj.get(did_key, "")
+            prof = profiles.get(did, {})
+            for field in ("enzymes", "transporters", "targets"):
+                for item in prof.get(field, []):
+                    for token in re.findall(r"CYP\w+|P-gp|P-glycoprotein|\w+", item):
+                        if len(token) > 2:
+                            gt_ents.add(token.upper())
 
-        llm = LLM(
-            model=model_name,
-            tensor_parallel_size=jcfg["tensor_parallel_size"],
-            dtype=jcfg["dtype"],
-            max_model_len=jcfg.get("max_model_len", 4096),
-            gpu_memory_utilization=jcfg.get("gpu_memory_utilization", 0.90),
-            trust_remote_code=True,
+        if not gt_ents:
+            continue
+
+        hits = pred_ents & gt_ents
+        total_precision_num += len(hits)
+        total_precision_den += len(pred_ents)
+        total_recall_num += len(hits)
+        total_recall_den += len(gt_ents)
+        n_pairs += 1
+
+    precision = total_precision_num / total_precision_den if total_precision_den else 0
+    recall = total_recall_num / total_recall_den if total_recall_den else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    logger.info(f"  Mechanism entity extraction ({n_pairs} pairs):")
+    logger.info(f"    Precision: {precision:.4f}")
+    logger.info(f"    Recall:    {recall:.4f}")
+    logger.info(f"    F1:        {f1:.4f}")
+
+    return {
+        "entity_precision": round(precision, 4),
+        "entity_recall": round(recall, 4),
+        "entity_f1": round(f1, 4),
+        "entity_n_pairs": n_pairs,
+    }
+
+
+def evaluate_grounded_entity_precision(pred_file: str, profiles: dict, logger):
+    """Grounded Entity Precision: fraction of entity mentions in reasoning
+    that are actually present in the drug pair's KB profile.
+
+    Unlike evaluate_entities which uses regex extraction, this metric scans
+    the full output text for any drug/enzyme/transporter name from the
+    specific pair's profile and checks if the model hallucinated entities
+    not grounded in the knowledge base.
+    """
+    grounded_total, mentioned_total = 0, 0
+    n_pairs = 0
+    per_profile_results = {"rich": [], "sparse": [], "empty": []}
+
+    for obj in _iter_prediction_rows(pred_file, logger):
+        output = obj.get("output", "")
+        if not output or obj.get("pred_label", -1) < 0:
+            continue
+
+        pair_entities = set()
+        profile_field_count = 0
+        for did_key in ("drug1_id", "drug2_id"):
+            did = obj.get(did_key, "")
+            prof = profiles.get(did, {})
+            for field in ("enzymes", "transporters", "targets"):
+                items = prof.get(field, [])
+                profile_field_count += len(items)
+                for raw in items:
+                    name = raw.split("(")[0].split(":")[0].strip()
+                    if len(name) >= 3:
+                        pair_entities.add(name.upper())
+
+        output_upper = output.upper()
+        mentioned = set()
+        for ent in pair_entities:
+            if ent in output_upper:
+                mentioned.add(ent)
+
+        regex_ents = extract_mechanism_entities(output)
+        all_mentioned = mentioned | regex_ents
+        if not all_mentioned:
+            continue
+
+        grounded = sum(1 for e in all_mentioned if e in pair_entities)
+        grounded_total += grounded
+        mentioned_total += len(all_mentioned)
+        n_pairs += 1
+
+        gep = grounded / len(all_mentioned)
+        if profile_field_count >= 4:
+            per_profile_results["rich"].append(gep)
+        elif profile_field_count >= 1:
+            per_profile_results["sparse"].append(gep)
+        else:
+            per_profile_results["empty"].append(gep)
+
+    overall_gep = grounded_total / mentioned_total if mentioned_total > 0 else 0.0
+
+    logger.info(f"  Grounded Entity Precision ({n_pairs} pairs):")
+    logger.info(f"    Overall GEP: {overall_gep:.4f}")
+    for tier, vals in per_profile_results.items():
+        if vals:
+            logger.info(f"    {tier} profile ({len(vals)}): "
+                        f"GEP={np.mean(vals):.4f}")
+
+    result = {
+        "grounded_entity_precision": round(overall_gep, 4),
+        "gep_n_pairs": n_pairs,
+    }
+    for tier, vals in per_profile_results.items():
+        if vals:
+            result[f"gep_{tier}_profile"] = round(float(np.mean(vals)), 4)
+            result[f"gep_{tier}_n"] = len(vals)
+    return result
+
+
+# ── Reasoning quality (BERTScore, ROUGE-L) ────────────────────────────
+
+def evaluate_reasoning(pred_file: str, cot_traces: dict, cfg: dict, logger):
+    """BERTScore and ROUGE-L against teacher traces."""
+    pairs = []
+    for obj in _iter_prediction_rows(pred_file, logger):
+        idx = obj["idx"]
+        if idx in cot_traces and obj.get("output"):
+            pairs.append((obj["output"], cot_traces[idx]))
+
+    if not pairs:
+        logger.warning("  No matched pairs for reasoning evaluation")
+        return {}
+
+    sample_size = min(5000, len(pairs))
+    import random
+    random.seed(cfg["project"]["seed"])
+    pairs = random.sample(pairs, sample_size)
+    preds, refs = zip(*pairs)
+
+    results = {}
+
+    try:
+        from bert_score import score as bert_score
+        P, R, F = bert_score(
+            list(preds), list(refs),
+            model_type=cfg["evaluation"].get("bertscore_model",
+                                             "microsoft/deberta-xlarge-mnli"),
+            batch_size=32,
         )
-        tokenizer = llm.get_tokenizer()
-        max_tokens = 1200 if no_sys else 800
-        params = SamplingParams(temperature=m_temp, top_p=0.9, max_tokens=max_tokens)
+        results["bertscore_f1"] = round(F.mean().item(), 4)
+        logger.info(f"  BERTScore F1: {results['bertscore_f1']}")
+    except ImportError:
+        logger.warning("  bert_score not installed, skipping")
 
-        ckpt_f = open(ckpt_path, "a")
-        for batch_start in range(0, len(remaining), BATCH_SIZE):
-            batch = remaining[batch_start:batch_start + BATCH_SIZE]
-            prompts = []
-            for rec in batch:
-                reasoning = _extract_reasoning(rec.get("response", ""))[:2000]
-                true_label = rec["true_label"]
-                template = label_map.get(true_label, f"interaction type {true_label}")
-                d1_name = rec.get("drug1_name", rec["drug1_id"])
-                d2_name = rec.get("drug2_name", rec["drug2_id"])
-                label_text = template.replace("#Drug1", d1_name).replace("#Drug2", d2_name)
+    try:
+        from rouge_score import rouge_scorer
+        scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+        rl_scores = [scorer.score(r, p)["rougeL"].fmeasure
+                     for p, r in zip(preds, refs)]
+        results["rouge_l"] = round(np.mean(rl_scores), 4)
+        logger.info(f"  ROUGE-L:      {results['rouge_l']}")
+    except ImportError:
+        logger.warning("  rouge_score not installed, skipping")
 
-                user_msg = STUDENT_JUDGE_PROMPT.format(
-                    drug1_name=d1_name, drug2_name=d2_name,
-                    label_text=label_text, cot=reasoning,
-                )
-                if no_sys:
-                    messages = [{"role": "user",
-                                 "content": JUDGE_SYSTEM_MSG + "\n\n" + user_msg}]
-                else:
+    return results
+
+
+# ── ECE (Expected Calibration Error) ─────────────────────────────────
+
+def evaluate_ece(pred_file: str, n_bins: int = 15, logger=None):
+    """ECE from structural confidence: how many expected output fields are present."""
+    confidences, correct = [], []
+    for obj in _iter_prediction_rows(pred_file, logger):
+        if obj["pred_label"] < 0:
+            continue
+        output = obj.get("output", "")
+        signals = 0
+        total_signals = 4
+        if re.search(r"Y\s*=\s*\d+", output):
+            signals += 1
+        if re.search(r"Severity\s*:\s*(Major|Moderate|Minor)", output, re.IGNORECASE):
+            signals += 1
+        if re.search(r"Summary\s*:", output, re.IGNORECASE):
+            signals += 1
+        if re.search(r"Classification\s*:", output, re.IGNORECASE):
+            signals += 1
+        conf = signals / total_signals
+        confidences.append(conf)
+        correct.append(1 if obj["pred_label"] == obj["label"] else 0)
+
+    if not confidences:
+        return {"ece": None}
+
+    confidences = np.array(confidences)
+    correct = np.array(correct)
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (confidences > bin_edges[i]) & (confidences <= bin_edges[i + 1])
+        if mask.sum() > 0:
+            acc = correct[mask].mean()
+            conf = confidences[mask].mean()
+            ece += mask.sum() / len(confidences) * abs(acc - conf)
+
+    if logger:
+        logger.info(f"  ECE ({n_bins} bins): {ece:.4f}")
+    return {"ece": round(ece, 4)}
+
+
+def evaluate_ece_calibrated(cfg: dict, checkpoint_dir: str,
+                            condition_name: str, n_bins: int = 15,
+                            logger=None):
+    """Temperature-scaled ECE using vLLM logprobs on the predicted label token.
+
+    Learns an optimal temperature T on a calibration split, then reports
+    ECE on the test split with softmax(logits/T).
+    """
+    if logger is None:
+        logger = logging.getLogger("ece_calibrated")
+
+    scfg = cfg["student"]
+    model_name = scfg["model_name"]
+    processed = cfg["data"]["processed_dir"]
+
+    output_dir = os.path.join(cfg["evaluation"]["output_dir"], condition_name)
+    logprob_path = os.path.join(output_dir, "label_logprobs.jsonl")
+
+    test_path = os.path.join(processed, "test_cot.jsonl")
+    test_df = pd.read_json(test_path, lines=True)
+
+    if os.path.exists(logprob_path):
+        existing = sum(1 for _ in open(logprob_path))
+        logger.info(f"Resuming logprob collection: {existing} rows exist")
+    else:
+        existing = 0
+
+    if existing < len(test_df):
+        try:
+            from vllm import LLM, SamplingParams
+            from vllm.lora.request import LoRARequest
+            from src.data_preparation import SYSTEM_PROMPT, build_student_input
+
+            lora_r = scfg["lora"]["r"]
+            llm = LLM(
+                model=model_name, enable_lora=True,
+                max_lora_rank=lora_r, tensor_parallel_size=1,
+                trust_remote_code=True, max_model_len=scfg["max_length"],
+            )
+            lora_req = LoRARequest("student_lora", 1, checkpoint_dir)
+            sampling_params = SamplingParams(
+                temperature=0, max_tokens=512, logprobs=5,
+            )
+
+            with open(os.path.join(processed, "drug_profiles.json")) as f:
+                profiles = json.load(f)
+            retrieved = {}
+            retr_path = os.path.join(processed, "retrieved_examples_test.json")
+            if os.path.exists(retr_path):
+                with open(retr_path) as f:
+                    retrieved = json.load(f)
+
+            tokenizer = llm.get_tokenizer()
+            label_re = re.compile(r"Y\s*=\s*(\d+)")
+
+            with open(logprob_path, "a") as fout:
+                for idx, row in test_df.iterrows():
+                    if idx < existing:
+                        continue
+                    retr_idx = retrieved.get(str(idx), [])
+                    retr_examples = [r for r in retr_idx if isinstance(r, dict)] if retr_idx else None
+                    user_msg = build_student_input(row, profiles, retr_examples)
                     messages = [
-                        {"role": "system", "content": JUDGE_SYSTEM_MSG},
+                        {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_msg},
                     ]
+                    try:
+                        prompt = tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                    except TypeError:
+                        prompt = tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True,
+                        )
+                    outputs = llm.generate([prompt], sampling_params, lora_request=lora_req)
+                    text = outputs[0].outputs[0].text
+
+                    m = label_re.search(text)
+                    pred_label = int(m.group(1)) if m else -1
+
+                    max_logprob = None
+                    if outputs[0].outputs[0].logprobs:
+                        for step_lp in outputs[0].outputs[0].logprobs:
+                            if step_lp:
+                                for tok_id, lp_obj in step_lp.items():
+                                    decoded = lp_obj.decoded_token if hasattr(lp_obj, 'decoded_token') else tokenizer.decode([tok_id])
+                                    if decoded.strip().isdigit():
+                                        lp_val = lp_obj.logprob if hasattr(lp_obj, 'logprob') else lp_obj
+                                        if max_logprob is None or lp_val > max_logprob:
+                                            max_logprob = lp_val
+
+                    fout.write(json.dumps({
+                        "idx": int(idx),
+                        "gold_label": int(row["label"]),
+                        "pred_label": pred_label,
+                        "label_logprob": max_logprob,
+                    }) + "\n")
+
+        except ImportError:
+            logger.error("vLLM not available for calibrated ECE")
+            return {}
+
+    gold_labels, pred_labels, logprobs = [], [], []
+    with open(logprob_path) as f:
+        for line in f:
+            obj = json.loads(line)
+            if obj["pred_label"] < 0 or obj["label_logprob"] is None:
+                continue
+            gold_labels.append(obj["gold_label"])
+            pred_labels.append(obj["pred_label"])
+            logprobs.append(obj["label_logprob"])
+
+    if len(logprobs) < 10:
+        logger.warning(f"Only {len(logprobs)} valid logprobs; skipping calibrated ECE")
+        return {}
+
+    logprobs = np.array(logprobs)
+    correct = np.array([1 if g == p else 0 for g, p in zip(gold_labels, pred_labels)])
+
+    n = len(logprobs)
+    cal_size = n // 5
+    cal_lp, test_lp = logprobs[:cal_size], logprobs[cal_size:]
+    cal_correct, test_correct = correct[:cal_size], correct[cal_size:]
+
+    best_T, best_nll = 1.0, float("inf")
+    for T in np.linspace(0.1, 5.0, 50):
+        probs = np.exp(cal_lp / T)
+        probs = np.clip(probs, 1e-10, 1.0)
+        nll = -np.mean(cal_correct * np.log(probs) + (1 - cal_correct) * np.log(1 - probs))
+        if nll < best_nll:
+            best_nll = nll
+            best_T = T
+
+    calibrated_probs = np.exp(test_lp / best_T)
+    calibrated_probs = np.clip(calibrated_probs, 0, 1)
+
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece_cal = 0.0
+    for i in range(n_bins):
+        mask = (calibrated_probs > bin_edges[i]) & (calibrated_probs <= bin_edges[i + 1])
+        if mask.sum() > 0:
+            acc = test_correct[mask].mean()
+            conf = calibrated_probs[mask].mean()
+            ece_cal += mask.sum() / len(test_correct) * abs(acc - conf)
+
+    result = {
+        "ece_calibrated": round(float(ece_cal), 4),
+        "calibration_temperature": round(float(best_T), 3),
+    }
+    logger.info(f"  Calibrated ECE: {result['ece_calibrated']:.4f} (T={result['calibration_temperature']:.3f})")
+    return result
+
+
+def evaluate_self_consistency(cfg: dict, checkpoint_dir: str,
+                              condition_name: str, n_samples: int = 5,
+                              temperature: float = 0.7, logger=None):
+    """Self-consistency: generate N samples per test input, measure agreement.
+
+    Returns agreement rate (fraction of inputs where majority vote == mode)
+    and majority-vote accuracy (where mode == gold label).
+    """
+    if logger is None:
+        logger = logging.getLogger("self_consistency")
+
+    scfg = cfg["student"]
+    model_name = scfg["model_name"]
+    processed = cfg["data"]["processed_dir"]
+
+    output_dir = os.path.join(cfg["evaluation"]["output_dir"], condition_name)
+    sc_path = os.path.join(output_dir, "self_consistency.jsonl")
+
+    if os.path.exists(sc_path):
+        existing = sum(1 for _ in open(sc_path))
+        logger.info(f"Resuming self-consistency: {existing} rows exist")
+    else:
+        existing = 0
+
+    test_path = os.path.join(processed, "test_cot.jsonl")
+    test_df = pd.read_json(test_path, lines=True)
+
+    try:
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+        from src.data_preparation import SYSTEM_PROMPT, build_student_input
+
+        lora_r = scfg["lora"]["r"]
+        llm = LLM(
+            model=model_name, enable_lora=True,
+            max_lora_rank=lora_r, tensor_parallel_size=1,
+            trust_remote_code=True, max_model_len=scfg["max_length"],
+        )
+        lora_req = LoRARequest("student_lora", 1, checkpoint_dir)
+        sampling_params = SamplingParams(
+            n=n_samples, temperature=temperature,
+            max_tokens=512, top_p=0.95,
+        )
+
+        with open(os.path.join(processed, "drug_profiles.json")) as f:
+            profiles = json.load(f)
+        retrieved = {}
+        retr_path = os.path.join(processed, "retrieved_examples_test.json")
+        if os.path.exists(retr_path):
+            with open(retr_path) as f:
+                retrieved = json.load(f)
+
+        tokenizer = llm.get_tokenizer()
+        label_re = re.compile(r"Y\s*=\s*(\d+)")
+
+        with open(sc_path, "a") as fout:
+            for idx, row in test_df.iterrows():
+                if idx < existing:
+                    continue
+                retr_idx = retrieved.get(str(idx), [])
+                retr_examples = [r for r in retr_idx if isinstance(r, dict)] if retr_idx else None
+                user_msg = build_student_input(row, profiles, retr_examples)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ]
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                    )
+
+                outputs = llm.generate([prompt], sampling_params, lora_request=lora_req)
+
+                preds = []
+                for out in outputs[0].outputs:
+                    m = label_re.search(out.text)
+                    preds.append(int(m.group(1)) if m else -1)
+
+                row_data = {
+                    "idx": int(idx),
+                    "gold_label": int(row["label"]),
+                    "predictions": preds,
+                }
+                fout.write(json.dumps(row_data) + "\n")
+
+    except ImportError:
+        logger.error("vLLM not available for self-consistency evaluation")
+        return {}
+
+    agreements, majority_correct = [], []
+    with open(sc_path) as f:
+        for line in f:
+            obj = json.loads(line)
+            preds = [p for p in obj["predictions"] if p >= 0]
+            if not preds:
+                continue
+            counts = Counter(preds)
+            mode_label, mode_count = counts.most_common(1)[0]
+            agreements.append(mode_count / len(preds))
+            majority_correct.append(1 if mode_label == obj["gold_label"] else 0)
+
+    result = {}
+    if agreements:
+        result["sc_agreement"] = round(float(np.mean(agreements)), 4)
+        result["sc_majority_acc"] = round(float(np.mean(majority_correct)), 4)
+        logger.info(f"  Self-consistency agreement: {result['sc_agreement']:.4f}")
+        logger.info(f"  Majority-vote accuracy:     {result['sc_majority_acc']:.4f}")
+    return result
+
+
+def evaluate_efficiency(cfg: dict, checkpoint_dir: str,
+                        condition_name: str, n_warmup: int = 5,
+                        n_bench: int = 50, logger=None):
+    """Benchmark inference latency and throughput."""
+    if logger is None:
+        logger = logging.getLogger("efficiency")
+
+    scfg = cfg["student"]
+    model_name = scfg["model_name"]
+    processed = cfg["data"]["processed_dir"]
+
+    test_path = os.path.join(processed, "test_cot.jsonl")
+    test_df = pd.read_json(test_path, lines=True).head(n_warmup + n_bench)
+
+    try:
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+        from src.data_preparation import SYSTEM_PROMPT, build_student_input
+
+        lora_r = scfg["lora"]["r"]
+        llm = LLM(
+            model=model_name, enable_lora=True,
+            max_lora_rank=lora_r, tensor_parallel_size=1,
+            trust_remote_code=True, max_model_len=scfg["max_length"],
+        )
+        lora_req = LoRARequest("student_lora", 1, checkpoint_dir)
+        sampling_params = SamplingParams(
+            temperature=0, max_tokens=512,
+        )
+
+        with open(os.path.join(processed, "drug_profiles.json")) as f:
+            profiles = json.load(f)
+        retrieved = {}
+        retr_path = os.path.join(processed, "retrieved_examples_test.json")
+        if os.path.exists(retr_path):
+            with open(retr_path) as f:
+                retrieved = json.load(f)
+
+        tokenizer = llm.get_tokenizer()
+        prompts = []
+        for idx, row in test_df.iterrows():
+            retr_idx = retrieved.get(str(idx), [])
+            retr_examples = [r for r in retr_idx if isinstance(r, dict)] if retr_idx else None
+            user_msg = build_student_input(row, profiles, retr_examples)
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ]
+            try:
                 prompts.append(tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                ))
+            except TypeError:
+                prompts.append(tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
                 ))
 
-            outputs = llm.generate(prompts, params)
-            for rec, out in zip(batch, outputs):
-                resp = out.outputs[0].text.strip()
-                scores = _parse_judge_response(resp)
-                scores["idx"] = f"{rec['drug1_id']}_{rec['drug2_id']}"
-                scores["true_label"] = rec["true_label"]
-                scores["pred_label"] = rec["pred_label"]
-                scores["judge"] = short_name
-                scored[scores["idx"]] = scores
-                ckpt_f.write(json.dumps(scores) + "\n")
+        for p in prompts[:n_warmup]:
+            llm.generate([p], sampling_params, lora_request=lora_req)
 
-            ckpt_f.flush()
-            logger.info(f"  {short_name}: {len(scored)}/{len(records)} scored")
+        bench_prompts = prompts[n_warmup:]
+        t0 = time.time()
+        outputs = llm.generate(bench_prompts, sampling_params, lora_request=lora_req)
+        elapsed = time.time() - t0
 
-        ckpt_f.close()
+        total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        result = {
+            "latency_per_example_ms": round(elapsed / len(bench_prompts) * 1000, 1),
+            "throughput_tok_per_sec": round(total_tokens / elapsed, 1),
+            "avg_output_tokens": round(total_tokens / len(bench_prompts), 1),
+            "n_bench": len(bench_prompts),
+        }
+        logger.info(f"  Latency: {result['latency_per_example_ms']} ms/example")
+        logger.info(f"  Throughput: {result['throughput_tok_per_sec']} tok/s")
+        logger.info(f"  Avg output: {result['avg_output_tokens']} tokens")
+        return result
 
-        with open(score_path, "w") as f:
-            for s in scored.values():
-                f.write(json.dumps(s) + "\n")
-
-        all_judge_results[short_name] = list(scored.values())
-
-        del llm
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return all_judge_results
+    except ImportError:
+        logger.error("vLLM not available for efficiency benchmark")
+        return {}
 
 
-def _parse_judge_response(resp: str) -> dict:
-    resp_clean = re.sub(r"<think>.*?</think>", "", resp, flags=re.DOTALL).strip()
-    dims = ["drug_specificity", "mechanism_accuracy", "causal_chain",
-            "teaching_value", "factual_errors", "overall"]
-    scores = {}
-    for dim in dims:
-        pattern = dim.replace("_", "[_ ]") + r"\s*:\s*(\d)"
-        m = re.search(pattern, resp_clean, re.IGNORECASE)
-        scores[dim] = int(m.group(1)) if m else 0
+# ── Main evaluation pipeline ─────────────────────────────────────────
 
-    verdict_m = re.search(r"VERDICT\s*:\s*(PASS|FAIL)", resp_clean, re.IGNORECASE)
-    scores["verdict"] = verdict_m.group(1).upper() if verdict_m else (
-        "PASS" if scores.get("overall", 0) >= 3 else "FAIL"
-    )
-    return scores
+def run_evaluation(cfg: dict, condition_name: str, checkpoint_dir: str):
+    """Full multi-task evaluation for one condition."""
+    logger = setup_logging(f"evaluation_{condition_name}")
+    processed = cfg["data"]["processed_dir"]
 
+    logger.info(f"{'=' * 60}")
+    logger.info(f"Evaluation: {condition_name}")
+    logger.info(f"{'=' * 60}")
 
+    # Always call prediction with resume logic so partial files continue
+    # instead of being silently treated as complete.
+    pred_file = predict_finetuned(cfg, checkpoint_dir, condition_name)
 
+    with open(os.path.join(processed, "label_map.json")) as f:
+        label_map = {int(k): v for k, v in json.load(f).items()}
 
-def create_comparison_report(all_metrics: list, fig_dir: str):
-    logger = setup_logging("comparison")
-    os.makedirs(fig_dir, exist_ok=True)
+    coarse_map = {}
+    cm_path = os.path.join(processed, "coarse_category_map.json")
+    if os.path.exists(cm_path):
+        with open(cm_path) as f:
+            coarse_map = json.load(f)
 
-    df = pd.DataFrame([{
-        "Condition": m["condition"],
-        "Macro F1": m["macro_f1"],
-        "Micro F1": m["micro_f1"],
-        "Accuracy": m["accuracy"],
-        "Valid %": m["valid_pct"],
-    } for m in all_metrics])
+    profiles = {}
+    prof_path = os.path.join(processed, "drug_profiles.json")
+    if os.path.exists(prof_path):
+        with open(prof_path) as f:
+            profiles = json.load(f)
 
-    df.to_csv(os.path.join(fig_dir, "comparison_table.csv"), index=False)
-    logger.info(f"\nComparison:\n{df.to_string(index=False)}")
+    cot_traces = {}
+    trace_sources = [
+        os.path.join(processed, "test_cot.jsonl"),
+        os.path.join(processed, "cot_traces.jsonl"),
+    ]
+    loaded_trace_source = None
+    for p in trace_sources:
+        if os.path.exists(p):
+            with open(p) as f:
+                for line in f:
+                    obj = json.loads(line)
+                    idx = obj.get("idx", -1)
+                    trace = obj.get("teacher_cot", "") or obj.get("reasoning", "")
+                    if idx not in cot_traces and trace:
+                        cot_traces[idx] = trace
+            loaded_trace_source = os.path.basename(p)
+            break
+    if loaded_trace_source:
+        logger.info(f"  Loaded {len(cot_traces):,} reasoning references from {loaded_trace_source}")
+    else:
+        logger.warning("  No test-side reasoning references found; skipping BERTScore/ROUGE.")
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = range(len(df))
-    w = 0.3
-    ax.bar([i - w/2 for i in x], df["Macro F1"], w, label="Macro F1", color="#2196F3")
-    ax.bar([i + w/2 for i in x], df["Micro F1"], w, label="Micro F1", color="#FF9800")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(df["Condition"], rotation=20, ha="right", fontsize=9)
-    ax.set_ylabel("F1 Score")
-    ax.set_title("DDI Classification — All Conditions")
-    ax.legend()
-    ax.set_ylim(0, 1.05)
-    for i, row in df.iterrows():
-        ax.text(i - w/2, row["Macro F1"] + 0.02, f"{row['Macro F1']:.3f}",
-                ha="center", fontsize=7)
-        ax.text(i + w/2, row["Micro F1"] + 0.02, f"{row['Micro F1']:.3f}",
-                ha="center", fontsize=7)
-    plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "comparison_chart.png"), dpi=200)
-    plt.close()
+    all_results = {"condition": condition_name}
 
-    report_path = os.path.join(fig_dir, "evaluation_report.json")
+    all_results.update(evaluate_classification(pred_file, label_map, logger))
+    all_results.update(evaluate_severity(pred_file, logger))
+    all_results.update(evaluate_coarse(pred_file, coarse_map, logger))
+    all_results.update(evaluate_entities(pred_file, profiles, logger))
+    if profiles and condition_name != "B_label":
+        all_results.update(evaluate_grounded_entity_precision(pred_file, profiles, logger))
+    all_results.update(evaluate_ece(pred_file, logger=logger))
+
+    if cot_traces and condition_name != "B_label":
+        all_results.update(evaluate_reasoning(pred_file, cot_traces, cfg, logger))
+
+    try:
+        logger.info("\n--- Calibrated ECE ---")
+        all_results.update(evaluate_ece_calibrated(
+            cfg, checkpoint_dir, condition_name, logger=logger))
+    except Exception as e:
+        logger.warning(f"Calibrated ECE failed: {e}")
+
+    try:
+        logger.info("\n--- Efficiency benchmark ---")
+        all_results.update(evaluate_efficiency(
+            cfg, checkpoint_dir, condition_name, logger=logger))
+    except Exception as e:
+        logger.warning(f"Efficiency benchmark failed: {e}")
+
+    results_dir = os.path.join(cfg["project"]["output_dir"], "results")
+    report_path = os.path.join(results_dir, f"eval_report_{condition_name}.json")
     with open(report_path, "w") as f:
-        json.dump(all_metrics, f, indent=2, default=str)
-    logger.info(f"Report saved to {report_path}")
+        json.dump(all_results, f, indent=2)
+    logger.info(f"\nFull report saved to {report_path}")
+
+    return all_results
 
 
+def compare_conditions(cfg: dict, conditions: list[str]):
+    """Print comparison table across all evaluated conditions and save CSV."""
+    logger = setup_logging("eval_comparison")
+    results_dir = os.path.join(cfg["project"]["output_dir"], "results")
+
+    rows = []
+    for cond in conditions:
+        path = os.path.join(results_dir, f"eval_report_{cond}.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                rows.append(json.load(f))
+
+    if not rows:
+        logger.warning("No evaluation reports found")
+        return
+
+    cols = [
+        ("Macro F1", "macro_f1"), ("Micro F1", "micro_f1"),
+        ("Accuracy", "accuracy"), ("Sev F1", "severity_macro_f1"),
+        ("Coarse F1", "coarse_macro_f1"), ("Ent F1", "entity_f1"),
+        ("GEP", "grounded_entity_precision"),
+        ("ECE", "ece"), ("ECE-Cal", "ece_calibrated"),
+        ("BERTSc", "bertscore_f1"), ("ROUGE", "rouge_l"),
+        ("Latency", "latency_per_example_ms"),
+    ]
+
+    header = f"{'Condition':<22}" + "".join(f"{c[0]:>10}" for c in cols)
+    logger.info(f"\n{header}")
+    logger.info("-" * (22 + 10 * len(cols)))
+    for r in rows:
+        line = f"{r.get('condition', '?'):<22}"
+        for _, key in cols:
+            val = r.get(key, "-")
+            if isinstance(val, float):
+                line += f"{val:>10.4f}"
+            else:
+                line += f"{str(val):>10}"
+        logger.info(line)
+
+    csv_path = os.path.join(results_dir, "ablation_comparison.csv")
+    df = pd.DataFrame(rows)
+    df.to_csv(csv_path, index=False)
+    logger.info(f"\nComparison CSV saved to {csv_path}")
 
 
-def _load_records(path: str) -> list[dict]:
-    records = []
-    with open(path) as f:
-        for line in f:
-            records.append(json.loads(line))
-    return records
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Multi-task evaluation")
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--condition", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--compare", nargs="*",
+                        help="Compare multiple conditions")
+    parser.add_argument("--model-name", type=str, default=None,
+                        help="Override student model (for multi-scale experiments)")
+    parser.add_argument("--self-consistency", action="store_true",
+                        help="Run self-consistency evaluation (N=5 samples)")
+    parser.add_argument("--sc-samples", type=int, default=5)
+    args = parser.parse_args()
 
+    cfg = load_config(args.config)
 
-def _load_label_map(cfg: dict) -> dict:
-    path = os.path.join(cfg["data"]["processed_dir"], "label_map.json")
-    with open(path) as f:
-        return {int(k): v for k, v in json.load(f).items()}
+    if args.model_name:
+        cfg["student"]["model_name"] = args.model_name
+
+    if args.compare:
+        compare_conditions(cfg, args.compare)
+    else:
+        results = run_evaluation(cfg, args.condition, args.checkpoint)
+        if args.self_consistency:
+            sc_results = evaluate_self_consistency(
+                cfg, args.checkpoint, args.condition,
+                n_samples=args.sc_samples,
+            )
+            results.update(sc_results)
+            results_dir = os.path.join(cfg["project"]["output_dir"], "results")
+            report_path = os.path.join(results_dir, f"eval_report_{args.condition}.json")
+            with open(report_path, "w") as f:
+                json.dump(results, f, indent=2)

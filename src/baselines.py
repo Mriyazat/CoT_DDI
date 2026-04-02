@@ -1,18 +1,31 @@
 """
-Baseline models: zero-shot LLM, Random Forest, XGBoost on Morgan fingerprints.
+Baseline models for DDI prediction (129-class classification).
+
+Tier 1: Trivial baselines (random, majority, stratified)
+Tier 2: Traditional ML on molecular fingerprints + pharmacological features
+        - Morgan FP + XGBoost / Random Forest / MLP
+        - MACCS keys + XGBoost
+        - Pharmacological features + XGBoost
+        - Combined FP+Pharma + XGBoost
+
+All baselines evaluate on the same test set as the student model.
 """
 
 import os
 import json
-import re
 import time
 import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
+from collections import Counter
+
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import f1_score
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    f1_score, accuracy_score, classification_report, confusion_matrix,
+)
+from sklearn.preprocessing import MultiLabelBinarizer
 
 try:
     from xgboost import XGBClassifier
@@ -20,199 +33,325 @@ try:
 except ImportError:
     HAS_XGBOOST = False
 
-from src.utils import load_config, setup_logging, set_seed, ensure_dirs, gpu_info
-from src.data_preparation import SYSTEM_PROMPT, build_student_input
-from src.evaluation import extract_label
+try:
+    from rdkit import Chem, RDLogger
+    from rdkit.Chem import MACCSkeys
+    from rdkit.Chem import rdFingerprintGenerator
+    RDLogger.DisableLog("rdApp.*")
+    HAS_RDKIT = True
+except ImportError:
+    HAS_RDKIT = False
+
+from src.utils import load_config, setup_logging, set_seed, ensure_dirs
 
 
-def evaluate_zero_shot(cfg: dict):
-    from vllm import LLM, SamplingParams
+def _load_data(cfg):
+    """Load train/test JSONL and drug profiles."""
+    processed = cfg["data"]["processed_dir"]
+    train_df = pd.read_json(os.path.join(processed, "train.jsonl"), lines=True)
+    test_df = pd.read_json(os.path.join(processed, "test.jsonl"), lines=True)
+    with open(os.path.join(processed, "drug_profiles.json")) as f:
+        profiles = json.load(f)
+    return train_df, test_df, profiles
 
-    logger = setup_logging("baseline_zeroshot")
-    set_seed(cfg["project"]["seed"])
-    ensure_dirs(cfg)
 
-    test_path = os.path.join(cfg["data"]["processed_dir"], "test.jsonl")
-    test_df = pd.read_json(test_path, lines=True)
-    logger.info(f"Test set: {len(test_df):,} pairs")
+def _compute_metrics(y_true, y_pred, name, logger):
+    """Compute and log standard metrics."""
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    micro_f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
 
-    model_name = cfg["student"]["model_name"]
-    logger.info(f"Loading {model_name} via vLLM for zero-shot evaluation")
+    logger.info(f"{name} -- Acc: {acc:.4f} | Macro-F1: {macro_f1:.4f} | "
+                f"Weighted-F1: {weighted_f1:.4f} | Micro-F1: {micro_f1:.4f}")
 
-    llm = LLM(
-        model=model_name, dtype="bfloat16", max_model_len=2048,
-        gpu_memory_utilization=0.85, trust_remote_code=True,
-    )
-    tokenizer = llm.get_tokenizer()
+    return {
+        "model": name,
+        "accuracy": round(float(acc), 5),
+        "macro_f1": round(float(macro_f1), 5),
+        "weighted_f1": round(float(weighted_f1), 5),
+        "micro_f1": round(float(micro_f1), 5),
+    }
 
-    params = SamplingParams(
-        temperature=0.1, top_p=0.9,
-        max_tokens=cfg["evaluation"]["max_new_tokens"],
-    )
 
-    label_map_path = os.path.join(cfg["data"]["processed_dir"], "label_map.json")
-    label_hint = ""
-    if os.path.exists(label_map_path):
-        with open(label_map_path) as f:
-            label_map = json.load(f)
-        label_hint = "\n\nValid interaction types (Y values): " + ", ".join(
-            f"Y={k}" for k in sorted(label_map.keys(), key=int)
-        )
+# ── Tier 1: Trivial baselines ───────────────────────────────────────
 
-    prompts = []
-    for _, row in test_df.iterrows():
-        user_msg = (
-            build_student_input(row)
-            + "\n\nIMPORTANT: End your response with exactly this format: "
-            "Classification: Y=<number> — \"<interaction description>\""
-            + label_hint
-        )
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ]
-        prompts.append(tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        ))
-
-    logger.info(f"Generating responses for {len(prompts):,} pairs …")
-    batch_size = cfg["evaluation"]["batch_size"]
-    all_outputs = []
-    for i in tqdm(range(0, len(prompts), batch_size), desc="Zero-shot"):
-        all_outputs.extend(llm.generate(prompts[i:i + batch_size], params))
-
+def trivial_baselines(y_train, y_test, logger):
+    """Random, majority-class, and stratified-random baselines."""
+    rng = np.random.RandomState(42)
+    n_classes = len(set(y_train))
     results = []
-    for (_, row), out in zip(test_df.iterrows(), all_outputs):
-        text = out.outputs[0].text.strip()
-        results.append({
-            "drug1_id": row["drug1_id"],
-            "drug2_id": row["drug2_id"],
-            "true_label": int(row["label"]),
-            "pred_label": extract_label(text),
-            "response": text,
-        })
 
-    out_path = os.path.join(cfg["project"]["output_dir"], "results", "zeroshot_predictions.jsonl")
-    with open(out_path, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+    y_rand = rng.randint(0, n_classes, size=len(y_test))
+    results.append(_compute_metrics(y_test, y_rand, "Random (uniform)", logger))
 
-    preds = [r["pred_label"] for r in results]
-    trues = [r["true_label"] for r in results]
-    valid = [(t, p) for t, p in zip(trues, preds) if p >= 0]
-    if valid:
-        t_valid, p_valid = zip(*valid)
-        macro = f1_score(t_valid, p_valid, average="macro", zero_division=0)
-        micro = f1_score(t_valid, p_valid, average="micro", zero_division=0)
-        logger.info(f"Zero-shot — Macro F1: {macro:.4f} | Micro F1: {micro:.4f}")
-        logger.info(f"  Valid: {len(valid)} / {len(results)} ({100*len(valid)/len(results):.1f}%)")
+    majority = Counter(y_train).most_common(1)[0][0]
+    y_maj = np.full(len(y_test), majority)
+    results.append(_compute_metrics(y_test, y_maj, "Majority class", logger))
 
-    logger.info(f"Saved to {out_path}")
-    return out_path
+    counts = Counter(y_train)
+    total = sum(counts.values())
+    labels = sorted(counts.keys())
+    probs = [counts[l] / total for l in labels]
+    y_strat = rng.choice(labels, size=len(y_test), p=probs)
+    results.append(_compute_metrics(y_test, y_strat, "Stratified random", logger))
+
+    return results
 
 
-def _smiles_to_fingerprint(smiles: str, n_bits: int = 2048, radius: int = 2):
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import rdFingerprintGenerator
-    except ImportError:
-        return np.zeros(n_bits, dtype=np.int8)
+# ── Feature engineering ──────────────────────────────────────────────
 
+_morgan_gen_cache = {}
+
+def _smiles_to_morgan(smiles, n_bits=2048, radius=2):
+    if not smiles or not HAS_RDKIT:
+        return np.zeros(n_bits, dtype=np.uint8)
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return np.zeros(n_bits, dtype=np.int8)
-    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
-    return gen.GetFingerprintAsNumPy(mol).astype(np.int8)
+        return np.zeros(n_bits, dtype=np.uint8)
+    key = (n_bits, radius)
+    if key not in _morgan_gen_cache:
+        _morgan_gen_cache[key] = rdFingerprintGenerator.GetMorganGenerator(
+            radius=radius, fpSize=n_bits)
+    return _morgan_gen_cache[key].GetFingerprintAsNumPy(mol).astype(np.uint8)
 
 
-def _encode_fingerprints(df, n_bits, radius):
-    fp1 = np.stack([_smiles_to_fingerprint(s, n_bits, radius) for s in tqdm(df["drug1_smiles"], desc="FP1")])
-    fp2 = np.stack([_smiles_to_fingerprint(s, n_bits, radius) for s in tqdm(df["drug2_smiles"], desc="FP2")])
+def _smiles_to_maccs(smiles):
+    if not smiles or not HAS_RDKIT:
+        return np.zeros(167, dtype=np.uint8)
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return np.zeros(167, dtype=np.uint8)
+    fp = MACCSkeys.GenMACCSKeys(mol)
+    return np.array(fp, dtype=np.uint8)
+
+
+def _precompute_fp_cache(profiles, n_bits=2048, radius=2):
+    """Compute fingerprints once per drug, return a lookup dict."""
+    cache = {}
+    for did, p in profiles.items():
+        cache[did] = _smiles_to_morgan(p.get("smiles", ""), n_bits, radius)
+    return cache
+
+
+def build_morgan_features(df, profiles, n_bits=2048, radius=2):
+    """Concatenate Morgan FP of drug1 and drug2 using cached per-drug FPs."""
+    cache = _precompute_fp_cache(profiles, n_bits, radius)
+    zero = np.zeros(n_bits, dtype=np.uint8)
+    fp1 = np.stack([cache.get(did, zero) for did in df["drug1_id"]])
+    fp2 = np.stack([cache.get(did, zero) for did in df["drug2_id"]])
     return np.concatenate([fp1, fp2], axis=1)
 
 
-def train_ml_baseline(cfg: dict):
-    logger = setup_logging("baseline_ml")
-    try:
-        from rdkit import Chem
-    except ImportError:
-        logger.warning("rdkit not installed — skipping ML baseline")
-        return {"model": "RandomForest", "macro_f1": 0, "skipped": True}
+def build_maccs_features(df, profiles):
+    """Concatenate MACCS keys of drug1 and drug2 using cached per-drug FPs."""
+    cache = {}
+    for did, p in profiles.items():
+        cache[did] = _smiles_to_maccs(p.get("smiles", ""))
+    zero = np.zeros(167, dtype=np.uint8)
+    fp1 = np.stack([cache.get(did, zero) for did in df["drug1_id"]])
+    fp2 = np.stack([cache.get(did, zero) for did in df["drug2_id"]])
+    return np.concatenate([fp1, fp2], axis=1)
 
-    set_seed(cfg["project"]["seed"])
-    ml_cfg = cfg["baseline_ml"]
 
-    train_df = pd.read_json(os.path.join(cfg["data"]["processed_dir"], "train.jsonl"), lines=True)
-    test_df = pd.read_json(os.path.join(cfg["data"]["processed_dir"], "test.jsonl"), lines=True)
+def _collect_vocab(profiles, field):
+    """Collect all unique values for a pharmacological field across all drugs."""
+    vocab = set()
+    for p in profiles.values():
+        for item in p.get(field, []):
+            vocab.add(item.strip().lower())
+    return sorted(vocab)
 
-    X_train = _encode_fingerprints(train_df, ml_cfg["fingerprint_bits"], ml_cfg["fingerprint_radius"])
-    X_test = _encode_fingerprints(test_df, ml_cfg["fingerprint_bits"], ml_cfg["fingerprint_radius"])
-    y_train, y_test = train_df["label"].values, test_df["label"].values
 
-    rf = RandomForestClassifier(
-        n_estimators=ml_cfg["n_estimators"], max_depth=ml_cfg["max_depth"],
-        n_jobs=ml_cfg["n_jobs"], random_state=cfg["project"]["seed"],
-        class_weight="balanced",
-    )
+def build_pharma_features(df, profiles):
+    """Multi-hot encode targets, enzymes, transporters, categories for both drugs."""
+    fields = ["targets", "enzymes", "transporters", "categories"]
+    vocabs = {f: _collect_vocab(profiles, f) for f in fields}
+    item_to_idx = {}
+    offset = 0
+    for f in fields:
+        for i, item in enumerate(vocabs[f]):
+            item_to_idx[(f, item)] = offset + i
+        offset += len(vocabs[f])
+
+    total_dim = offset
+
+    drug_vectors = {}
+    for did, p in profiles.items():
+        vec = np.zeros(total_dim, dtype=np.float32)
+        for f in fields:
+            for item in p.get(f, []):
+                key = (f, item.strip().lower())
+                if key in item_to_idx:
+                    vec[item_to_idx[key]] = 1.0
+        drug_vectors[did] = vec
+
+    zero = np.zeros(total_dim, dtype=np.float32)
+    v1 = np.stack([drug_vectors.get(did, zero) for did in df["drug1_id"].values])
+    v2 = np.stack([drug_vectors.get(did, zero) for did in df["drug2_id"].values])
+    return np.concatenate([v1, v2], axis=1)
+
+
+# ── Tier 2: Traditional ML ──────────────────────────────────────────
+
+def train_and_evaluate(X_train, y_train, X_test, y_test, model, name, logger):
+    """Train a model, predict, and compute metrics."""
     t0 = time.time()
-    rf.fit(X_train, y_train)
-    logger.info(f"RF trained in {time.time()-t0:.1f}s")
+    model.fit(X_train, y_train)
+    train_time = time.time() - t0
+    logger.info(f"{name}: trained in {train_time:.1f}s on {X_train.shape} features")
 
-    y_pred = rf.predict(X_test)
-    macro = f1_score(y_test, y_pred, average="macro", zero_division=0)
-    micro = f1_score(y_test, y_pred, average="micro", zero_division=0)
-    logger.info(f"Random Forest — Macro F1: {macro:.4f} | Micro F1: {micro:.4f}")
-
-    results = {"model": "RandomForest", "macro_f1": float(macro), "micro_f1": float(micro)}
-    res_path = os.path.join(cfg["project"]["output_dir"], "results", "ml_baseline_results.json")
-    os.makedirs(os.path.dirname(res_path), exist_ok=True)
-    with open(res_path, "w") as f:
-        json.dump(results, f, indent=2)
-    return results
+    y_pred = model.predict(X_test)
+    result = _compute_metrics(y_test, y_pred, name, logger)
+    result["train_seconds"] = round(train_time, 1)
+    result["n_features"] = X_train.shape[1]
+    return result, y_pred
 
 
-def train_xgboost_baseline(cfg: dict):
-    logger = setup_logging("baseline_xgb")
-    if not HAS_XGBOOST:
-        logger.warning("xgboost not installed")
-        return {"model": "XGBoost", "macro_f1": 0, "skipped": True}
-    try:
-        from rdkit import Chem
-    except ImportError:
-        logger.warning("rdkit not installed")
-        return {"model": "XGBoost", "macro_f1": 0, "skipped": True}
-
-    set_seed(cfg["project"]["seed"])
+def ml_baselines(cfg, train_df, test_df, profiles, logger, skip=0):
+    """Run all Tier 2 ML baselines. skip=N to skip first N models."""
     ml_cfg = cfg["baseline_ml"]
+    seed = cfg["project"]["seed"]
+    results = []
 
-    train_df = pd.read_json(os.path.join(cfg["data"]["processed_dir"], "train.jsonl"), lines=True)
-    test_df = pd.read_json(os.path.join(cfg["data"]["processed_dir"], "test.jsonl"), lines=True)
-
-    X_train = _encode_fingerprints(train_df, ml_cfg["fingerprint_bits"], ml_cfg["fingerprint_radius"])
-    X_test = _encode_fingerprints(test_df, ml_cfg["fingerprint_bits"], ml_cfg["fingerprint_radius"])
-    y_train, y_test = train_df["label"].values, test_df["label"].values
-
+    y_train = train_df["label"].values
+    y_test = test_df["label"].values
     label_min = int(y_train.min())
-    y_train_z, y_test_z = y_train - label_min, y_test - label_min
 
-    xgb = XGBClassifier(
-        n_estimators=500, max_depth=8, learning_rate=0.1,
-        subsample=0.8, colsample_bytree=0.8, objective="multi:softmax",
-        num_class=len(np.unique(y_train_z)), n_jobs=-1,
-        random_state=cfg["project"]["seed"], tree_method="hist",
-    )
-    t0 = time.time()
-    xgb.fit(X_train, y_train_z)
-    logger.info(f"XGBoost trained in {time.time()-t0:.1f}s")
+    logger.info("Building Morgan fingerprint features...")
+    X_train_fp = build_morgan_features(
+        train_df, profiles, ml_cfg["fingerprint_bits"], ml_cfg["fingerprint_radius"])
+    X_test_fp = build_morgan_features(
+        test_df, profiles, ml_cfg["fingerprint_bits"], ml_cfg["fingerprint_radius"])
 
-    y_pred = xgb.predict(X_test) + label_min
-    macro = f1_score(y_test, y_pred, average="macro", zero_division=0)
-    micro = f1_score(y_test, y_pred, average="micro", zero_division=0)
-    logger.info(f"XGBoost — Macro F1: {macro:.4f} | Micro F1: {micro:.4f}")
+    logger.info("Building MACCS key features...")
+    X_train_maccs = build_maccs_features(train_df, profiles)
+    X_test_maccs = build_maccs_features(test_df, profiles)
 
-    results = {"model": "XGBoost", "macro_f1": float(macro), "micro_f1": float(micro)}
-    res_path = os.path.join(cfg["project"]["output_dir"], "results", "xgb_baseline_results.json")
-    os.makedirs(os.path.dirname(res_path), exist_ok=True)
+    logger.info("Building pharmacological features...")
+    X_train_pharma = build_pharma_features(train_df, profiles)
+    X_test_pharma = build_pharma_features(test_df, profiles)
+
+    logger.info("Building combined FP+Pharma features...")
+    X_train_combined = np.concatenate([X_train_fp, X_train_pharma], axis=1)
+    X_test_combined = np.concatenate([X_test_fp, X_test_pharma], axis=1)
+
+    logger.info(f"Feature dims: Morgan={X_train_fp.shape[1]}, MACCS={X_train_maccs.shape[1]}, "
+                f"Pharma={X_train_pharma.shape[1]}, Combined={X_train_combined.shape[1]}")
+
+    configs = [
+        ("Morgan FP + XGBoost", X_train_fp, X_test_fp, "xgb"),
+        ("Morgan FP + RF", X_train_fp, X_test_fp, "rf"),
+        ("Morgan FP + MLP", X_train_fp, X_test_fp, "mlp"),
+        ("MACCS + XGBoost", X_train_maccs, X_test_maccs, "xgb"),
+        ("Pharma + XGBoost", X_train_pharma, X_test_pharma, "xgb"),
+        ("FP+Pharma + XGBoost", X_train_combined, X_test_combined, "xgb"),
+    ]
+
+    all_preds = {}
+    for idx, (name, X_tr, X_te, model_type) in enumerate(configs, 1):
+        if idx <= skip:
+            logger.info(f"\n[{idx}/{len(configs)}] Skipping {name} (already completed)")
+            continue
+        logger.info(f"\n[{idx}/{len(configs)}] Training {name}  ({X_tr.shape[0]:,} x {X_tr.shape[1]:,}) ...")
+        if model_type == "xgb":
+            if not HAS_XGBOOST:
+                logger.warning(f"Skipping {name}: xgboost not installed")
+                continue
+            n_classes = len(np.unique(y_train))
+            model = XGBClassifier(
+                n_estimators=ml_cfg["n_estimators"],
+                max_depth=ml_cfg["max_depth"],
+                learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
+                objective="multi:softmax", num_class=n_classes,
+                n_jobs=ml_cfg["n_jobs"], random_state=seed, tree_method="hist",
+                verbosity=1,
+            )
+            y_tr = y_train - label_min
+            r, y_pred_shifted = train_and_evaluate(X_tr, y_tr, X_te, y_test - label_min, model, name, logger)
+            all_preds[name] = y_pred_shifted + label_min
+            r_actual = _compute_metrics(y_test, all_preds[name], name, logger)
+            r_actual["train_seconds"] = r["train_seconds"]
+            r_actual["n_features"] = r["n_features"]
+            results.append(r_actual)
+        elif model_type == "rf":
+            model = RandomForestClassifier(
+                n_estimators=ml_cfg["n_estimators"], max_depth=ml_cfg["max_depth"],
+                n_jobs=ml_cfg["n_jobs"], random_state=seed, class_weight="balanced",
+                verbose=1,
+            )
+            r, y_pred = train_and_evaluate(X_tr, y_train, X_te, y_test, model, name, logger)
+            all_preds[name] = y_pred
+            results.append(r)
+        elif model_type == "mlp":
+            model = MLPClassifier(
+                hidden_layer_sizes=(512, 256), max_iter=50, early_stopping=True,
+                random_state=seed, verbose=True,
+            )
+            r, y_pred = train_and_evaluate(X_tr, y_train, X_te, y_test, model, name, logger)
+            all_preds[name] = y_pred
+            results.append(r)
+
+    return results, all_preds
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--skip", type=int, default=0,
+                        help="Skip the first N ML models (use to resume)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config if hasattr(args, 'config') else None)
+    logger = setup_logging("baselines")
+    set_seed(cfg["project"]["seed"])
+    ensure_dirs(cfg)
+
+    logger.info("=== DDI Baseline Evaluation ===")
+    train_df, test_df, profiles = _load_data(cfg)
+    logger.info(f"Train: {len(train_df):,} | Test: {len(test_df):,} | "
+                f"Profiles: {len(profiles):,} | Classes: {train_df['label'].nunique()}")
+
+    y_train = train_df["label"].values
+    y_test = test_df["label"].values
+
+    all_results = []
+
+    logger.info("\n--- Tier 1: Trivial baselines ---")
+    trivial = trivial_baselines(y_train, y_test, logger)
+    all_results.extend(trivial)
+
+    if HAS_RDKIT:
+        logger.info("\n--- Tier 2: ML baselines ---")
+        ml_results, ml_preds = ml_baselines(cfg, train_df, test_df, profiles, logger, skip=args.skip)
+        all_results.extend(ml_results)
+    else:
+        logger.warning("rdkit not installed -- skipping ML baselines")
+        ml_preds = {}
+
+    res_dir = os.path.join(cfg["project"]["output_dir"], "results")
+    os.makedirs(res_dir, exist_ok=True)
+
+    res_path = os.path.join(res_dir, "baseline_results.json")
     with open(res_path, "w") as f:
-        json.dump(results, f, indent=2)
-    return results
+        json.dump(all_results, f, indent=2)
+    logger.info(f"\nResults saved to {res_path}")
+
+    if ml_preds:
+        pred_path = os.path.join(res_dir, "baseline_predictions.pkl")
+        with open(pred_path, "wb") as f:
+            pickle.dump({"y_test": y_test, "predictions": ml_preds}, f)
+        logger.info(f"Predictions saved to {pred_path}")
+
+    logger.info("\n=== Summary ===")
+    logger.info(f"{'Method':<30} {'Acc':>8} {'Macro-F1':>10} {'Wtd-F1':>10}")
+    logger.info("-" * 60)
+    for r in all_results:
+        logger.info(f"{r['model']:<30} {r['accuracy']:>8.4f} {r['macro_f1']:>10.4f} {r['weighted_f1']:>10.4f}")
+
+
+if __name__ == "__main__":
+    main()
